@@ -1,0 +1,18 @@
+syntax = "proto3";
+package proto;
+option go_package = "./pb";
+
+message VoteRequest { uint64 logfile_index = 1; }
+
+message VoteResponse {
+  enum VoteType {
+    VOTE_REQUESTED = 0;
+    VOTE_GIVEN = 1;
+    VOTE_REFUSED = 2;
+  };
+  VoteType vote_type = 1;
+}
+
+service ElectionService {
+  rpc Voting(VoteRequest) returns (VoteResponse) {}
+}
