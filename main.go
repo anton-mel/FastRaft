@@ -2,21 +2,26 @@ package main
 
 import (
 	"log"
+	"strings"
 	"time"
 )
 
-func main() {
-	s1 := StartKVServer(":3000", []string{})
-	s2 := StartKVServer(":4000", []string{":3000"})
-	s3 := StartKVServer(":5000", []string{":3000", ":4000"})
+var separator string = strings.Repeat("=", 32)
 
-	time.Sleep(time.Second * 2) // let the system start properly
+func main() {
+	s1 := StartKVServer(":1000", []string{})
+	s2 := StartKVServer(":1001", []string{":1000"})
+	s3 := StartKVServer(":1002", []string{":1001", ":1000"})
+
+	time.Sleep(time.Second * 3) // let the system start properly
 
 	// start sending operations from client
-	s1.ApplyOperation("PUT:10,20")
-
-	time.Sleep(time.Second * 1)
+	s1.ApplyOperation("SOME_COMMAND_STR1")
+	s2.ApplyOperation("SOME_COMMAND_STR2")
+	s3.ApplyOperation("SOME_COMMAND_STR3")
 
 	// check if the operation was replicated across clusters
-	log.Printf("s1 KV map: %v, s2 KV map: %v, s3 KV map: %v\n", s1.kv, s2.kv, s3.kv)
+	log.Printf("s1 KV map: %v\n", s1.kv)
+	log.Printf("s2 KV map: %v\n", s2.kv)
+	log.Printf("s3 KV map: %v\n", s3.kv)
 }

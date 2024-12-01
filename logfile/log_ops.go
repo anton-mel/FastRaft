@@ -5,91 +5,117 @@ import (
 	"sync"
 )
 
+type Log interface {
+	Size() int                                          // returns the number of entries in the logfile
+	CommitOperation(int, int, *LogElement) (int, error) // commits the operation
+	ApplyOperation() (*LogElement, error)               // applies the last committed operation to logfile
+	GetFinalTransaction() (*LogElement, error)
+	GetTransactionWithIndex(int) (*LogElement, error)
+	RemoveEntries(int) (int, error)
+}
+
+type Logfile struct {
+	logfileLength int
+	readyTxn      *LogElement // the last commmitted transaction
+	logs          []LogElement
+	mu            sync.Mutex
+}
+
 type LogElement struct {
-	Term    int
-	Command interface{}
 	Index   int
+	Command string
+	Term    int
 }
 
-type ApplyMsg struct {
-	CommandValid bool
-	Command      interface{}
-	CommandIndex int
-}
-
-type Log struct {
-	mu   sync.Mutex
-	logs []LogElement
-}
-
-func NewLog() *Log {
-	return &Log{
+func NewLogfile() *Logfile {
+	return &Logfile{
 		logs: make([]LogElement, 0),
 	}
 }
 
-func (l *Log) Append(term int, command interface{}) {
+// `CommitOperation` is the first step of the two phase commit.
+// It is initiated by the `leader` to check whether the requested
+// transaction is okay to be committed in the replica
+// returns the finalIndex after CommitOperation
+func (l *Logfile) CommitOperation(expectedFinalIndex int, currentFinalIndex int, txn *LogElement) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	index := len(l.logs)
-	l.logs = append(l.logs, LogElement{
-		Term:    term,
-		Command: command,
-		Index:   index,
-	})
-}
-
-func (l *Log) Get(index int) (*LogElement, error) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	if index < 0 || index >= len(l.logs) {
-		return nil, fmt.Errorf("log index %d out of range", index)
+	if currentFinalIndex != expectedFinalIndex {
+		return currentFinalIndex, fmt.Errorf("final index (%d) not matching expected final index (%d)", currentFinalIndex, expectedFinalIndex)
 	}
-	return &l.logs[index], nil
+
+	// if final index is matching, then add the replica is
+	// ready to apply the incoming transaction to the Logfile
+	// So, the replica keeps track of this transaction until the
+	// second phase of the two phase commit (apply phase)
+	l.readyTxn = txn
+	l.logs = append(l.logs, *txn)
+	l.logfileLength++
+	return currentFinalIndex, nil
 }
 
-func (l *Log) Last() (*LogElement, error) {
+// `ApplyOperation` is the first step of the two phase commit.
+// It is initiated by the `leader` to finally apply the previously
+// verified transaction in the `commitOperation` step
+// `ApplyOperation` applies the committed operation to the logfile.
+func (l *Logfile) ApplyOperation() (*LogElement, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if l.readyTxn == nil {
+		return nil, fmt.Errorf("no transaction ready to apply")
+	}
+
+	// Apply the transaction to Logfile
+	// In this case, the transaction is already added to logs during CommitOperation
+	// so no further action is needed other than returning the transaction.
+	appliedTxn := l.readyTxn
+	l.readyTxn = nil
+	return appliedTxn, nil
+}
+
+func (l *Logfile) GetFinalTransaction() (*LogElement, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if len(l.logs) == 0 {
-		return nil, fmt.Errorf("log is empty")
+		return nil, nil
 	}
 	return &l.logs[len(l.logs)-1], nil
 }
 
-func (l *Log) Size() int {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-
-	return len(l.logs)
-}
-
-func (l *Log) Truncate(index int) error {
+func (l *Logfile) GetTransactionWithIndex(index int) (*LogElement, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if index < 0 || index >= len(l.logs) {
-		return fmt.Errorf("log index %d out of range", index)
+		return nil, fmt.Errorf("index out of range")
 	}
+	return &l.logs[index], nil
+}
+
+func (l *Logfile) RemoveEntries(index int) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if index < 0 || index >= len(l.logs) {
+		return -1, fmt.Errorf("index out of range")
+	}
+
+	// Remove entries from logs up to the given index
 	l.logs = l.logs[:index]
-	return nil
+	l.logfileLength = len(l.logs)
+	return l.logfileLength, nil
 }
 
-func (l *Log) Apply(index int) (*ApplyMsg, error) {
+func (l *Logfile) Size() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
-	if index < 0 || index >= len(l.logs) {
-		return nil, fmt.Errorf("log index %d out of range", index)
-	}
-
-	log := l.logs[index]
-	return &ApplyMsg{
-		CommandValid: true,
-		Command:      log.Command,
-		CommandIndex: log.Index,
-	}, nil
+	return l.logfileLength
 }
+
+// Helper function to stringify data (for logging purposes)
+// func stringifyData(data *LogElement) string {
+// 	return fmt.Sprintf("%d;%v;%d\n", data.Index, data.Command, data.Term)
+// }

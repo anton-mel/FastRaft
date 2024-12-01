@@ -11,7 +11,6 @@ import (
 	"6.824/heartbeat"
 	"6.824/logfile"
 	"6.824/pb"
-	"golang.org/x/exp/rand"
 
 	"google.golang.org/grpc"
 )
@@ -26,11 +25,10 @@ const (
 
 const (
 	HEARTBEAT_PERIOD  = 100 * time.Millisecond
-	HEARTBEAT_TIMEOUT = time.Second * 10
+	HEARTBEAT_TIMEOUT = 1000 * time.Millisecond
 )
 
 type RaftServer struct {
-	me    string   // Current replicas' port
 	role  int      // Current replicas' role
 	peers []string // Ports for of all the peers
 
@@ -46,10 +44,10 @@ type RaftServer struct {
 	votedFor     string
 	cWinElection chan struct{}
 
-	transport Transport              // gRPC to join replicas' list
-	Heartbeat *heartbeat.Heartbeat   // gRPC for leader connection
-	applyCh   chan *logfile.ApplyMsg // Ch to apply state machine updates
-	logfile   *logfile.Log           // Keep DB simple (look logfile)
+	transport Transport                // gRPC to join replicas' list
+	Heartbeat *heartbeat.Heartbeat     // gRPC for leader connection
+	applyCh   chan *logfile.LogElement // ch to apply state machine updates
+	logfile   *logfile.Logfile         // array of LogEntries
 
 	// { address of server, connection client }, we will maintain
 	// the connections and reuse them to reduce latency using
@@ -81,8 +79,12 @@ func (rf *RaftServer) PerformOperation(operation string) error {
 	return sendOperationToLeader(operation, rf.ReplicaConnMap[rf.leaderAddr])
 }
 
-func (rf *RaftServer) convertToTransaction(operation string) (*logfile.ApplyMsg, error) {
-	return &logfile.ApplyMsg{CommandValid: true, Command: operation, CommandIndex: rf.commitIdx + 1}, nil
+func (s *RaftServer) convertToTransaction(operation string) (*logfile.LogElement, error) {
+	return &logfile.LogElement{
+		Index:   s.commitIdx + 1,
+		Command: operation,
+		Term:    s.currentTerm,
+	}, nil
 }
 
 // `sendOperationToLeader` is called when an operation reaches a FOLLOWER.
@@ -100,94 +102,124 @@ func sendOperationToLeader(operation string, conn *grpc.ClientConn) error {
 }
 
 // Performs a two phase commit on all the FOLLOWERS
-func (rf *RaftServer) performTwoPhaseCommit(txn *logfile.ApplyMsg) error {
+func (rf *RaftServer) performTwoPhaseCommit(txn *logfile.LogElement) error {
+	// since we are planning to commit commands beyond the node
+	// initialization, let's refactor our logfile interface.
 	rf.ReplicaConnMapLock.RLock()
-	// wg := &sync.WaitGroup{}
+	wg := &sync.WaitGroup{}
 
 	// First phase of the TwoPhaseCommit: Commit operation
 
-	// CommitOperation on self: Use the Apply method from logfile to commit the operation
-	_, err := rf.logfile.Apply(rf.commitIdx)
-	if err != nil {
+	// CommitOperation on self
+	if _, err := rf.logfile.CommitOperation(rf.commitIdx, rf.commitIdx, txn); err != nil {
 		panic(fmt.Errorf("[%s] %v", rf.transport.Addr(), err))
 	}
 
 	log.Printf("[%s] performing commit operation on %d followers\n", rf.transport.Addr(), len(rf.ReplicaConnMap))
 
-	// // Replicate commit to all followers
-	// for addr, conn := range rf.ReplicaConnMap {
-	// 	replicateOpsClient := pb.NewReplicateOperationServiceClient(conn)
-	// 	log.Printf("[%s] sending (CommitOperation: %s) to [%s]\n", rf.transport.Addr(), txn.Command, addr)
-	// 	response, err := replicateOpsClient.CommitOperation(
-	// 		context.Background(),
-	// 		&pb.CommitTransaction{
-	// 			ExpectedFinalIndex: int64(rf.commitIdx),
-	// 			Index:              int64(txn.CommandIndex),
-	// 			Operation:          txn.Command,
-	// 			Term:               int64(txn.Term),
-	// 		},
-	// 	)
-	// 	if err != nil {
-	// 		log.Printf("[%s] received error in (CommitOperation) from [%s]: %v", rf.transport.Addr(), addr, err)
-	// 		// if there is both, an error and a response, the FOLLOWER is missing
-	// 		// some logs. So the LEADER will replicate all the missing logs in the FOLLOWER
-	// 		if response != nil {
-	// 			wg.Add(1)
-	// 			go rf.replicateMissingLogs(int(response.LogfileFinalIndex), addr, replicateOpsClient, wg)
-	// 		} else {
-	// 			return err
-	// 		}
-	// 	}
-	// }
+	for addr, conn := range rf.ReplicaConnMap {
+		replicateOpsClient := pb.NewReplicateOperationServiceClient(conn)
+		log.Printf("[%s] sending (CommitOperation: %s) to [%s]\n", rf.transport.Addr(), txn.Command, addr)
+		response, err := replicateOpsClient.CommitOperation(
+			context.Background(),
+			&pb.CommitTransaction{
+				ExpectedFinalIndex: int64(rf.commitIdx),
+				Index:              int64(txn.Index),
+				Operation:          txn.Command,
+				Term:               int64(txn.Term),
+			},
+		)
+		if err != nil {
+			log.Printf("[%s] received error in (CommitOperation) from [%s]: %v", rf.transport.Addr(), addr, err)
+			// if there is both, an error and a response, the FOLLOWER is missing
+			// some logs. So the LEADER will replicate all the missing logs in the FOLLOWER
+			if response != nil {
+				wg.Add(1)
+				go rf.replicateMissingLogs(int(response.LogfileFinalIndex), addr, replicateOpsClient, wg)
+			} else {
+				return err
+			}
+		}
+	}
 
-	// // wait for all FOLLOWERS to be consistent
-	// wg.Wait()
+	// wait for all FOLLOWERS to be consistent
+	wg.Wait()
 
-	// log.Printf("[%s] performing (ApplyOperation) on %d followers\n", rf.transport.Addr(), len(rf.ReplicaConnMap))
+	// Second phase of the TwoPhaseCommit: Apply operation
 
-	// // Second phase of the TwoPhaseCommit: Apply operation
+	// ApplyOperation on self
+	_, err := rf.logfile.ApplyOperation()
+	if err != nil {
+		panic(err)
+	}
 
-	// // ApplyOperation on self
-	// if _, err := rf.logfile.ApplyOperation(); err != nil {
-	// 	panic(err)
-	// }
+	log.Printf("[%s] performing (ApplyOperation) on %d followers\n", rf.transport.Addr(), len(rf.ReplicaConnMap))
 
-	// for _, conn := range rf.ReplicaConnMap {
-	// 	replicateOpsClient := pb.NewReplicateOperationServiceClient(conn)
-	// 	_, err := replicateOpsClient.ApplyOperation(
-	// 		context.Background(),
-	// 		&pb.ApplyOperationRequest{},
-	// 	)
-	// 	if err != nil {
-	// 		return err
-	// 	}
-	// }
-	// rf.ReplicaConnMapLock.RUnlock()
+	rf.commitIdx++ // increment the final commitIndex after applying changes
+	rf.applyCh <- txn
 
-	// rf.commitIdx++ // increment the final commitIndex after applying changes
-
-	// rf.applyCh <- txn
+	for _, conn := range rf.ReplicaConnMap {
+		replicateOpsClient := pb.NewReplicateOperationServiceClient(conn)
+		_, err := replicateOpsClient.ApplyOperation(
+			context.Background(),
+			&pb.ApplyOperationRequest{},
+		)
+		if err != nil {
+			return err
+		}
+	}
+	rf.ReplicaConnMapLock.RUnlock()
 
 	return nil
 }
 
-func (rf *RaftServer) GetState() (int, bool) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	return rf.currentTerm, (rf.role == LEADER)
+// `replicateMissingLogs` makes a FOLLOWER consistent with the leader. This is
+// called when the FOLLOWER is missing some logs and refuses a commit operation
+// request from the LEADER
+func (rf *RaftServer) replicateMissingLogs(startIndex int, addr string, client pb.ReplicateOperationServiceClient, wg *sync.WaitGroup) {
+	defer wg.Done()
+	for {
+		startIndex++
+		txn, err := rf.logfile.GetTransactionWithIndex(startIndex)
+		if err != nil {
+			log.Printf("[%s] error fetching (index: %d) from Logfile\n", rf.transport.Addr(), startIndex)
+			break
+		}
+		if txn == nil {
+			break
+		}
+		_, err = client.CommitOperation(
+			context.Background(),
+			&pb.CommitTransaction{
+				ExpectedFinalIndex: int64(startIndex),
+				Index:              int64(txn.Index),
+				Operation:          txn.Command,
+				Term:               int64(txn.Term),
+			},
+		)
+		if err != nil {
+			log.Printf("[%s] error replicating missing log (index: %d) to [%s]\n", rf.transport.Addr(), startIndex, addr)
+		}
+	}
 }
 
-type RequestVoteArgs struct {
-	Term         int
-	CandidateId  string
-	LastLogIndex int
-	LastLogTerm  int
-}
+// func (rf *RaftServer) GetState() (int, bool) {
+// 	rf.mu.Lock()
+// 	defer rf.mu.Unlock()
+// 	return rf.currentTerm, (rf.role == LEADER)
+// }
 
-type RequestVoteReply struct {
-	Term        int
-	VoteGranted bool
-}
+// type RequestVoteArgs struct {
+// 	Term         int
+// 	CandidateId  string
+// 	LastLogIndex int
+// 	LastLogTerm  int
+// }
+
+// type RequestVoteReply struct {
+// 	Term        int
+// 	VoteGranted bool
+// }
 
 // func (rf *RaftServer) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // 	rf.mu.Lock()
@@ -249,20 +281,20 @@ type RequestVoteReply struct {
 // }
 
 // Figure 2 of Raft paper
-type AppendEntriesArgs struct {
-	Term         int
-	LeaderId     string
-	PrevLogIdx   int
-	PrevLogTerm  int
-	Entries      []logfile.LogElement
-	LeaderCommit int
-}
+// type AppendEntriesArgs struct {
+// 	Term         int
+// 	LeaderId     string
+// 	PrevLogIdx   int
+// 	PrevLogTerm  int
+// 	Entries      []logfile.LogElement
+// 	LeaderCommit int
+// }
 
-type AppendEntriesResults struct {
-	Term       int
-	Success    bool
-	NextTryIdx int
-}
+// type AppendEntriesResults struct {
+// 	Term       int
+// 	Success    bool
+// 	NextTryIdx int
+// }
 
 // func (rf *RaftServer) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesResults) {
 // 	rf.mu.Lock()
@@ -415,7 +447,11 @@ func (rf *RaftServer) requestVotes() int {
 func (rf *RaftServer) sendHeartbeat() int {
 	aliveCount := 0
 	rf.ReplicaConnMapLock.RLock()
+	defer rf.ReplicaConnMapLock.RUnlock()
 	for addr, conn := range rf.ReplicaConnMap {
+		if addr == rf.transport.Addr() {
+			continue
+		}
 		heartbeatClient := pb.NewHeartbeatServiceClient(conn)
 		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(time.Second*1))
 		defer cancel()
@@ -432,59 +468,53 @@ func (rf *RaftServer) sendHeartbeat() int {
 			aliveCount++
 		}
 	}
-	rf.ReplicaConnMapLock.RUnlock()
 	return aliveCount
 }
 
 // `broadcastHeartbeat` is called by the leader to
 // send a heartbeat to followers every second
 func (rf *RaftServer) broadcastHeartbeat() {
-	// start the process of sending heartbeat for a leader
-	for {
-		log.Printf("[%s] sending heartbeat to %d followers\n", rf.transport.Addr(), len(rf.ReplicaConnMap))
-		aliveReplicas := rf.sendHeartbeat()
-		if aliveReplicas < (len(rf.ReplicaConnMap)-1)/2 {
-			panic("more than half of the replicas are down")
-		}
-		// limited to 10 heartbeats per second
-		time.Sleep(HEARTBEAT_PERIOD)
+	log.Printf("[%s] sending heartbeat to %d followers\n", rf.transport.Addr(), len(rf.ReplicaConnMap))
+	aliveReplicas := rf.sendHeartbeat()
+	// This should not happen, but just to be safe
+	if aliveReplicas < (len(rf.ReplicaConnMap)-1)/2 {
+		panic("more than half of the replicas are down")
 	}
 }
 
-// The ticker go routine starts a new election if this peer hasn't received
-// heartsbeats recently.
+// The ticker go routine starts a new election
+// if this peer hasn't received heartsbeats recently
 func (rf *RaftServer) ticker() {
-	for {
-		timeoutDuration := time.Duration(rand.Intn(200)+1100) * time.Millisecond
-
+	for { // state switch process
 		rf.mu.Lock()
 		switch rf.role {
 		case FOLLOWER:
-			// Start heartbeat timeout only if not already set
+			rf.mu.Unlock()
+			// start the heartbeat timeout
+			// only if not already set
 			if rf.Heartbeat == nil {
-				// Initialize a new heartbeat with timeout
-				rf.Heartbeat = heartbeat.NewHeartbeat(timeoutDuration, func() {
-					log.Printf("[%s] FOLLOWER timeout expired\n", rf.transport.Addr())
+				log.Printf("[%s] FOLLOWER: Starting timeout\n", rf.transport.Addr())
+				// this is not needed, since we are anyways working in the real environment
+				// timeoutHeartbeat := time.Duration(rand.Intn(200)+1100) * time.Millisecond
+				rf.Heartbeat = heartbeat.NewHeartbeat(HEARTBEAT_TIMEOUT, func() {
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
+					log.Printf("[%s] FOLLOWER timeout expired, becoming CANDIDATE\n", rf.transport.Addr())
 					rf.role = CANDIDATE
 				})
 			} else if rf.Heartbeat.Expired() {
-				// Reset the heartbeat timer if it has expired
-				log.Printf("[%s] Restarting FOLLOWER timeout\n", rf.transport.Addr())
+				// if the timout is stopped,
+				// restart (from LEADER/CANDIDATE)
 				rf.Heartbeat.Beat()
 			}
 
 		case CANDIDATE:
-			rf.currentTerm++
-			rf.votedFor = rf.me
-			rf.numVotes = 1
+			log.Printf("Elections Started...\n")
+			rf.mu.Unlock()
 
-			// Log election timeout
-			log.Printf("Starting election\n")
-
-			// Send request vote to other peers
 			votesWon := rf.requestVotes()
+
+			rf.mu.Lock()
 			totalVotes := 1 + votesWon
 			totalCandidates := 1 + len(rf.ReplicaConnMap)
 			// a candidate wins the election and becomes a leader
@@ -492,32 +522,37 @@ func (rf *RaftServer) ticker() {
 			if totalVotes >= totalCandidates/2 {
 				// if it wins the election, turn it into a LEADER
 				// and start sending heartbeat process
-				log.Printf("[%s] is the leader", rf.transport.Addr())
-				rf.role = LEADER
 				rf.currentTerm++
+				rf.role = LEADER
 				rf.leaderAddr = rf.transport.Addr()
+
+				log.Printf("[%v] LEADER in term %d", rf.transport.Addr(), rf.currentTerm)
 
 				// if the replica becomes a LEADER, it does not need to listen
 				// for heartbeat from other replicas anymore, so stop the
-				// heartbeat timeout process
+				// heartbeat timeout process if exists
 				rf.Heartbeat.Stop()
 			} else {
 				// if it loses the election, turn it back in to a follower
+				log.Printf("[%s] CANDIDATE: Lost election, reverting to FOLLOWER\n", rf.transport.Addr())
 				rf.role = FOLLOWER
 			}
+			rf.mu.Unlock()
 
 		case LEADER:
+			rf.mu.Unlock()
+
 			// the LEADER will send heartbeat to the FOLLOWERS
 			go rf.broadcastHeartbeat()
-		}
 
-		rf.mu.Unlock()
-		time.Sleep(timeoutDuration)
+			// limited to 10 heartbeats per second
+			time.Sleep(HEARTBEAT_PERIOD)
+		}
 	}
 }
 
-// Additional: sends requests to other replicas so that they can
-// add this server to their replicaConnMap (establish gRPC connection)
+// Sends requests to other replicas so that they can add this
+// server to their replicaConnMap (establish gRPC connection)
 func (rf *RaftServer) bootstrapNetwork() {
 	wg := &sync.WaitGroup{}
 	for _, addr := range rf.peers {
@@ -537,32 +572,32 @@ func (rf *RaftServer) bootstrapNetwork() {
 	log.Printf("[%s] bootstrapping completed\n", rf.transport.Addr())
 }
 
-// Additional: SetUp the gRPC servers
+// SetUp the gRPC servers
 func (rf *RaftServer) startGrpcServer() error {
 	lis, err := net.Listen("tcp", rf.transport.Addr())
 	if err != nil {
 		return fmt.Errorf("failed to listen on port %s: %v", rf.transport.Addr(), err)
 	}
 
-	// register services with the gRPC server
 	grpcServer := grpc.NewServer()
+	// register one gRPC server with services per each node.
+	// keep the connections map `ReplicaConnMap` for faster restart
+	// by saving it to the snapshot and fetching when needed (stretch goal)
+	pb.RegisterBootstrapServiceServer(grpcServer, NewBootstrapServiceServer(rf)) // keep the same
+	pb.RegisterHeartbeatServiceServer(grpcServer, NewHeartbeatServiceServer(rf)) // modified
+	pb.RegisterElectionServiceServer(grpcServer, NewElectionServiceServer(rf))
+	pb.RegisterReplicateOperationServiceServer(grpcServer, NewReplicateOpsServiceServer(rf))
 
-	// I will keep it as a separate services, since it is actually a clean approach
-	pb.RegisterBootstrapServiceServer(grpcServer, NewBootstrapServiceServer(rf))
-	pb.RegisterHeartbeatServiceServer(grpcServer, NewHeartbeatServiceServer(rf))
-	// pb.RegisterElectionServiceServer(grpcServer, NewElectionServiceServer(s))
-	// pb.RegisterReplicateOperationServiceServer(grpcServer, NewReplicateOpsServiceServer(s))
 	if err = grpcServer.Serve(lis); err != nil {
 		return fmt.Errorf("failed to serve gRPC on port %s: %v", rf.transport.Addr(), err)
 	}
 	return nil
 }
 
-func MakeRaftServer(me string, applyCh chan *logfile.ApplyMsg, peers []string) *RaftServer {
+func MakeRaftServer(me string, applyCh chan *logfile.LogElement, peers []string) *RaftServer {
 	rf := &RaftServer{}
 
 	rf.mu.Lock()
-	rf.me = me
 	rf.role = FOLLOWER
 	rf.peers = peers
 
@@ -579,35 +614,25 @@ func MakeRaftServer(me string, applyCh chan *logfile.ApplyMsg, peers []string) *
 
 	rf.transport = &GRPCTransport{ListenAddr: me}
 	rf.applyCh = applyCh
-	rf.logfile = logfile.NewLog()
+	rf.logfile = logfile.NewLogfile()
 	rf.ReplicaConnMap = make(map[string]*grpc.ClientConn)
 	rf.mu.Unlock()
 
 	return rf
 }
 
-// We cannot do this before grpc is setted up (keep it for reference)
-// func (rf *RaftServer) Start(command interface{}) (int, int, bool) {
-// 	rf.mu.Lock()
-// 	defer rf.mu.Unlock()
-// 	index := -1
-// 	term := -1
-// 	isLeader := rf.role == LEADER
-
-// 	if isLeader {
-// 		term = rf.currentTerm
-// 		index = rf.logs[len(rf.logs)-1].Index + 1
-// 		rf.logs = append(rf.logs, logfile.LogElement{Term: term, Command: command, Index: index})
-// 	}
-
-// 	return index, term, isLeader
-// }
-
 func (rf *RaftServer) Start() error {
+	// start function should not apply the command on launch
+	// bur rather let's create a separate performOperation
+	// function to send as many requests as needed, which
+	// provides more flexibility in unit testing Raft
 	go rf.startGrpcServer()
 	time.Sleep(time.Second * 3) // wait for server to start
 
-	log.Printf("[%s] raft server started\n", rf.transport.Addr())
+	log.Printf("%s\n", separator)
+	log.Printf("   🚀 Raft Server Started 🚀   \n")
+	log.Printf("       Address: [%s]         \n", rf.transport.Addr())
+	log.Printf("%s\n", separator)
 
 	// send request to bootstrapped servers to
 	// add this to replica to their `replicaConnMap`

@@ -20,6 +20,7 @@ func (t *GRPCTransport) Addr() string {
 }
 
 func (t *GRPCTransport) Dial(s *RaftServer, addr string) error {
+	// Establish the gRPC connection with insecure credentials
 	conn, err := grpc.NewClient(
 		addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),

@@ -1,0 +1,32 @@
+syntax = "proto3";
+package proto;
+option go_package = "./pb";
+
+// Log entry structure
+message LogElement {
+  int32 index = 1;
+  int32 term = 2;
+  string command = 3;
+}
+
+// Request for AppendEntries
+message AppendEntriesRequest {
+  int32 term = 1;
+  int32 leaderId = 2;
+  int32 prevLogIdx = 3;
+  int32 prevLogTerm = 4;
+  repeated LogElement entries = 5;
+  int32 leaderCommit = 6;
+}
+
+// Response for AppendEntries
+message AppendEntriesResponse {
+  int32 term = 1;
+  bool success = 2;
+  int32 nextTryIdx = 3;
+}
+
+// Raft service definition
+service RaftService {
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+}
