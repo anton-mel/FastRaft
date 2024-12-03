@@ -16,9 +16,9 @@ func main() {
 	time.Sleep(time.Second * 3) // let the system start properly
 
 	// start sending operations from client
-	s1.ApplyOperation("SOME_COMMAND_STR1")
-	s2.ApplyOperation("SOME_COMMAND_STR2")
-	s3.ApplyOperation("SOME_COMMAND_STR3")
+	// s1.ApplyOperation("SOME_COMMAND_STR1")
+	// s2.ApplyOperation("SOME_COMMAND_STR2")
+	// s3.ApplyOperation("SOME_COMMAND_STR3")
 
 	// check if the operation was replicated across clusters
 	log.Printf("s1 KV map: %v\n", s1.kv)

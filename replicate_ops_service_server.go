@@ -4,7 +4,6 @@ import (
 	"context"
 	"log"
 
-	"6.824/logfile"
 	"6.824/pb"
 )
 
@@ -22,7 +21,7 @@ func (s *ReplicateOpsServiceServer) CommitOperation(context context.Context, txn
 	logfileFinalIndex, err := s.raftServer.logfile.CommitOperation(
 		int(txn.ExpectedFinalIndex),
 		s.raftServer.commitIdx,
-		&logfile.LogElement{Index: int(txn.Index), Command: txn.Operation, Term: int(txn.Term)},
+		&pb.LogElement{Index: int32(txn.Index), Command: txn.Operation, Term: int32(txn.Term)},
 	)
 	if err != nil {
 		return nil, err

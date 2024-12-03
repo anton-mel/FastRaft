@@ -12,7 +12,7 @@ message LogElement {
 // Request for AppendEntries
 message AppendEntriesRequest {
   int32 term = 1;
-  int32 leaderId = 2;
+  string leader = 2;
   int32 prevLogIdx = 3;
   int32 prevLogTerm = 4;
   repeated LogElement entries = 5;

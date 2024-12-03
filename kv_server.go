@@ -4,20 +4,20 @@ import (
 	"log"
 	"sync"
 
-	"6.824/logfile"
+	"6.824/pb"
 )
 
 type KVServer struct {
-	rf      *RaftServer              // Raft server handles consensus and log replication
-	applyCh chan *logfile.LogElement // Channel to apply committed transactions
-	kv      map[int]string           // Key-value store
-	kvLock  sync.RWMutex             // RW lock for thread-safety
+	rf      *RaftServer         // Raft server handles consensus and log replication
+	applyCh chan *pb.LogElement // Channel to apply committed transactions
+	kv      map[int]string      // Key-value store
+	kvLock  sync.RWMutex        // RW lock for thread-safety
 }
 
 func NewKVServer() *KVServer {
 	return &KVServer{
 		kv:      make(map[int]string),
-		applyCh: make(chan *logfile.LogElement, 100),
+		applyCh: make(chan *pb.LogElement, 100),
 	}
 }
 
@@ -39,11 +39,11 @@ func (s *KVServer) applyTransactionLoop() {
 }
 
 // applyTransaction applies a single transaction to the KV store
-func (s *KVServer) applyTransaction(txn *logfile.LogElement) {
+func (s *KVServer) applyTransaction(txn *pb.LogElement) {
 	log.Printf("[%s] applying operation (%s) to KV store\n", s.rf.transport.Addr(), txn.Command)
 
 	command := txn.Command
-	idx := txn.Index
+	idx := int(txn.Index)
 	s.put(idx, command)
 }
 

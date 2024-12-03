@@ -3,33 +3,29 @@ package logfile
 import (
 	"fmt"
 	"sync"
+
+	"6.824/pb"
 )
 
 type Log interface {
-	Size() int                                          // returns the number of entries in the logfile
-	CommitOperation(int, int, *LogElement) (int, error) // commits the operation
-	ApplyOperation() (*LogElement, error)               // applies the last committed operation to logfile
-	GetFinalTransaction() (*LogElement, error)
-	GetTransactionWithIndex(int) (*LogElement, error)
+	Size() int                                             // returns the number of entries in the logfile
+	CommitOperation(int, int, *pb.LogElement) (int, error) // commits the operation
+	ApplyOperation() (*pb.LogElement, error)               // applies the last committed operation to logfile
+	GetFinalTransaction() (*pb.LogElement, error)
+	GetTransactionWithIndex(int) (*pb.LogElement, error)
 	RemoveEntries(int) (int, error)
 }
 
 type Logfile struct {
 	logfileLength int
-	readyTxn      *LogElement // the last commmitted transaction
-	logs          []LogElement
+	readyTxn      *pb.LogElement // the last commmitted transaction
+	logs          []pb.LogElement
 	mu            sync.Mutex
-}
-
-type LogElement struct {
-	Index   int
-	Command string
-	Term    int
 }
 
 func NewLogfile() *Logfile {
 	return &Logfile{
-		logs: make([]LogElement, 0),
+		logs: make([]pb.LogElement, 0),
 	}
 }
 
@@ -37,7 +33,7 @@ func NewLogfile() *Logfile {
 // It is initiated by the `leader` to check whether the requested
 // transaction is okay to be committed in the replica
 // returns the finalIndex after CommitOperation
-func (l *Logfile) CommitOperation(expectedFinalIndex int, currentFinalIndex int, txn *LogElement) (int, error) {
+func (l *Logfile) CommitOperation(expectedFinalIndex int, currentFinalIndex int, txn *pb.LogElement) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -59,7 +55,7 @@ func (l *Logfile) CommitOperation(expectedFinalIndex int, currentFinalIndex int,
 // It is initiated by the `leader` to finally apply the previously
 // verified transaction in the `commitOperation` step
 // `ApplyOperation` applies the committed operation to the logfile.
-func (l *Logfile) ApplyOperation() (*LogElement, error) {
+func (l *Logfile) ApplyOperation() (*pb.LogElement, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -75,7 +71,7 @@ func (l *Logfile) ApplyOperation() (*LogElement, error) {
 	return appliedTxn, nil
 }
 
-func (l *Logfile) GetFinalTransaction() (*LogElement, error) {
+func (l *Logfile) GetFinalTransaction() (*pb.LogElement, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
@@ -85,7 +81,7 @@ func (l *Logfile) GetFinalTransaction() (*LogElement, error) {
 	return &l.logs[len(l.logs)-1], nil
 }
 
-func (l *Logfile) GetTransactionWithIndex(index int) (*LogElement, error) {
+func (l *Logfile) GetTransactionWithIndex(index int) (*pb.LogElement, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
