@@ -22,7 +22,7 @@ func NewKVServer() *KVServer {
 }
 
 func (s *KVServer) ApplyOperation(operation string) (string, error) {
-	return "", s.rf.PerformOperation(operation)
+	return "", s.rf.PerformOperation(operation) // returns only errors
 }
 
 // background service to listen for applyOperation from Raft server
@@ -33,7 +33,7 @@ func (s *KVServer) applyTransactionLoop() {
 			continue
 		}
 		// received transaction from Raft server, now replicate
-		// the operation in KV store
+		// the operation in KV store (state machine)
 		s.applyTransaction(txn)
 	}
 }
@@ -60,7 +60,7 @@ func StartKVServer(addr string, peers []string) *KVServer {
 	// the snapshots, currently if node fails we will not
 	// restore the information back (will not keep it).
 	kvServer.rf = MakeRaftServer(addr, kvServer.applyCh, peers)
-	kvServer.rf.Start()
+	kvServer.rf.StartRaftServer()
 
 	go kvServer.applyTransactionLoop()
 

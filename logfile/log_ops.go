@@ -25,7 +25,9 @@ type Logfile struct {
 
 func NewLogfile() *Logfile {
 	return &Logfile{
-		logs: make([]pb.LogElement, 0),
+		// keep as a base empty value for further easier access and copying
+		logs:          []pb.LogElement{{Term: 0, Index: 0, Command: ""}},
+		logfileLength: 1,
 	}
 }
 
@@ -110,8 +112,3 @@ func (l *Logfile) Size() int {
 	defer l.mu.Unlock()
 	return l.logfileLength
 }
-
-// Helper function to stringify data (for logging purposes)
-// func stringifyData(data *LogElement) string {
-// 	return fmt.Sprintf("%d;%v;%d\n", data.Index, data.Command, data.Term)
-// }
