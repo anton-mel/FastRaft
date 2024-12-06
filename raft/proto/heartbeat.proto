@@ -1,0 +1,17 @@
+syntax = "proto3";
+package proto;
+option go_package = "./pb";
+
+message HeartbeatRequest {
+  bool isAlive = 1;
+  string Addr = 2;
+}
+
+message HeartbeatResponse {
+  bool isAlive = 1;
+  string Addr = 2;
+}
+
+service HeartbeatService {
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse) {}
+}
