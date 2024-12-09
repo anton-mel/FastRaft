@@ -14,6 +14,7 @@ type Log interface {
 	GetFinalTransaction() (*pb.LogElement, error)
 	GetTransactionWithIndex(int) (*pb.LogElement, error)
 	RemoveEntries(int) (int, error)
+	GetAllLogs(int) *[]pb.LogElement
 }
 
 type Logfile struct {
@@ -71,6 +72,18 @@ func (l *Logfile) ApplyOperation() (*pb.LogElement, error) {
 	appliedTxn := l.readyTxn
 	l.readyTxn = nil
 	return appliedTxn, nil
+}
+
+func (l *Logfile) GetAllLogs() []*pb.LogElement {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	logPointers := make([]*pb.LogElement, len(l.logs))
+	for i := range l.logs {
+		logPointers[i] = &l.logs[i]
+	}
+
+	return logPointers
 }
 
 func (l *Logfile) GetFinalTransaction() (*pb.LogElement, error) {

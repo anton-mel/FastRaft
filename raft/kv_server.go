@@ -64,12 +64,12 @@ func StartKVServer(addr string, peers []string) *KVServer {
 
 	// NOTE! Currently this just rewrites the data,
 	// so we probably want to handle it more wisely
-	kvServer.saved[addr] = MakePersister()
+	// kvServer.saved[addr] = MakePersister()
 
 	// So akin to their solution, we might want to check
 	// the snapshots, currently if node fails we will not
 	// restore the information back (will not keep it).
-	kvServer.rf = MakeRaftServer(addr, kvServer.saved[addr], kvServer.applyCh, peers)
+	kvServer.rf = MakeRaftServer(addr, kvServer.applyCh, peers)
 	kvServer.rf.StartRaftServer()
 
 	go kvServer.applyTransactionLoop()

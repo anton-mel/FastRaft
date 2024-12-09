@@ -1,0 +1,27 @@
+syntax = "proto3";
+package proto;
+option go_package = "./pb";
+
+import "raft/proto/raft.proto";
+
+service LoadDriverService {
+  rpc ApplyCommand (ApplyCommandRequest) returns (ApplyCommandResponse);
+  rpc GetLogs (GetLogsRequest) returns (GetLogsResponse);
+}
+
+message ApplyCommandRequest {
+  string node_address = 1;
+  string command = 2;
+}
+
+message ApplyCommandResponse {
+  bool success = 1;
+}
+
+message GetLogsRequest {
+  string node_address = 1;
+}
+
+message GetLogsResponse {
+  repeated proto.LogElement logs = 1;
+}

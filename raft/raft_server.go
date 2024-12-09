@@ -1,7 +1,6 @@
 package raft
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -10,7 +9,6 @@ import (
 	"time"
 
 	"6.824/log"
-	"6.824/raft/labgob"
 	"6.824/raft/pb"
 
 	"6.824/raft/heartbeat"
@@ -27,9 +25,9 @@ const (
 )
 
 type RaftServer struct {
-	role      int        // Current replicas' role
-	peers     []string   // Ports for of all the peers
-	persister *Persister // Object to hold this peer's persisted state
+	role  int      // Current replicas' role
+	peers []string // Ports for of all the peers
+	// persister *Persister
 
 	leaderAddr  string
 	currentTerm int
@@ -68,30 +66,30 @@ func (rf *RaftServer) GetState() bool {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 // NOTE: only call when holding lock
-func (rf *RaftServer) persist() {
-	log.DPrintf("[%v] (persist) Persisting state", rf.Transport.Addr())
-	w := new(bytes.Buffer)
-	e := labgob.NewEncoder(w)
-	if e.Encode(rf.currentTerm) != nil || e.Encode(rf.votedFor) != nil || e.Encode(rf.logfile) != nil {
-		log.DPrintf("[%v] (persist) Error encoding state", rf.Transport.Addr())
-		return
-	}
-	rf.persister.SaveRaftState(w.Bytes())
-}
+// func (rf *RaftServer) persist() {
+// 	log.DPrintf("[%v] (persist) Persisting state", rf.Transport.Addr())
+// 	w := new(bytes.Buffer)
+// 	e := labgob.NewEncoder(w)
+// 	if e.Encode(rf.currentTerm) != nil || e.Encode(rf.votedFor) != nil || e.Encode(rf.logfile) != nil {
+// 		log.DPrintf("[%v] (persist) Error encoding state", rf.Transport.Addr())
+// 		return
+// 	}
+// 	rf.persister.SaveRaftState(w.Bytes())
+// }
 
 // restore previously persisted state.
 // NOTE: only call when holding lock
-func (rf *RaftServer) readPersist(data []byte) {
-	log.DPrintf("[%v] (readPersist) Reading persisted state", rf.Transport.Addr())
-	if data == nil || len(data) < 1 { // bootstrap without any state?
-		return
-	}
-	r := bytes.NewBuffer(data)
-	d := labgob.NewDecoder(r)
-	if d.Decode(&rf.currentTerm) != nil || d.Decode(&rf.votedFor) != nil || d.Decode(&rf.logfile) != nil {
-		log.DPrintf("[%v] (readPersist) Error decoding state", rf.Transport.Addr())
-	}
-}
+// func (rf *RaftServer) readPersist(data []byte) {
+// 	log.DPrintf("[%v] (readPersist) Reading persisted state", rf.Transport.Addr())
+// 	if data == nil || len(data) < 1 { // bootstrap without any state?
+// 		return
+// 	}
+// 	r := bytes.NewBuffer(data)
+// 	d := labgob.NewDecoder(r)
+// 	if d.Decode(&rf.currentTerm) != nil || d.Decode(&rf.votedFor) != nil || d.Decode(&rf.logfile) != nil {
+// 		log.DPrintf("[%v] (readPersist) Error decoding state", rf.Transport.Addr())
+// 	}
+// }
 
 func (s *RaftServer) convertToTransaction(operation string) (*pb.LogElement, error) {
 	return &pb.LogElement{
@@ -215,7 +213,7 @@ func (rf *RaftServer) performTwoPhaseCommit(txn *pb.LogElement) error {
 	}
 	rf.ReplicaConnMapLock.RUnlock()
 
-	rf.persist()
+	// rf.persist()
 	return nil
 }
 
@@ -293,7 +291,7 @@ func (rf *RaftServer) sendRequestVote(server string, args *pb.RequestVoteRequest
 		rf.numVotes++
 		if rf.numVotes > len(rf.peers)/2 {
 			log.DPrintf("[%v] (sendRequestVote) Won election", rf.Transport.Addr())
-			rf.persist()
+			// rf.persist()
 			lastTxn, _ := rf.logfile.GetFinalTransaction()
 			nextIdx := lastTxn.Index + 1
 			for _, addr := range rf.peers {
@@ -358,7 +356,7 @@ func (rf *RaftServer) sendAppendEntries(server string, grpcArgs *pb.AppendEntrie
 		rf.currentTerm = int(reply.Term)
 		rf.role = FOLLOWER
 		rf.votedFor = ""
-		rf.persist() // NOTE: recent comment
+		// rf.persist()
 		return
 	}
 	if reply.Success {
@@ -501,7 +499,7 @@ func (rf *RaftServer) ticker() {
 					defer rf.mu.Unlock()
 					log.DPrintf("[%s] FOLLOWER timeout expired, becoming CANDIDATE", rf.Transport.Addr())
 					rf.role = CANDIDATE
-					rf.persist()
+					// rf.persist()
 				})
 			} else if rf.Heartbeat.Expired() {
 				// if the timout is stopped,
@@ -515,7 +513,7 @@ func (rf *RaftServer) ticker() {
 			log.DPrintf("[%s] CANDIDATE: Starting election for term %d", rf.Transport.Addr(), rf.currentTerm)
 			rf.votedFor = rf.Transport.Addr()
 			rf.numVotes = 1
-			rf.persist()
+			// rf.persist()
 			rf.mu.Unlock()
 
 			go rf.startElection()
@@ -537,10 +535,7 @@ func (rf *RaftServer) ticker() {
 			rf.mu.Unlock()
 			// the LEADER will send heartbeat to the FOLLOWERS
 			go rf.broadcastHeartbeat()
-
-			rf.mu.Lock()
-			rf.persist()
-			rf.mu.Unlock()
+			// rf.persist()
 
 			// limited to 10 heartbeats per second
 			time.Sleep(100 * time.Millisecond)
@@ -591,15 +586,13 @@ func (rf *RaftServer) bootstrapNetwork() {
 	log.DPrintf("[%s] bootstrapping completed", rf.Transport.Addr())
 }
 
-func MakeRaftServer(me string, persister *Persister,
-	applyCh chan *pb.LogElement, peers []string,
-) *RaftServer {
+func MakeRaftServer(me string, applyCh chan *pb.LogElement, peers []string) *RaftServer {
 	rf := &RaftServer{}
 
 	rf.mu.Lock()
 	rf.role = FOLLOWER
 	rf.peers = peers
-	rf.persister = persister
+	// rf.persister = persister
 
 	rf.currentTerm = 0
 	rf.appliedLast = 0
@@ -617,8 +610,8 @@ func MakeRaftServer(me string, persister *Persister,
 	rf.logfile = logfile.NewLogfile()
 	rf.ReplicaConnMap = make(map[string]*grpc.ClientConn)
 
-	rf.readPersist(persister.ReadRaftState())
-	rf.persist()
+	// rf.readPersist(persister.ReadRaftState())
+	// rf.persist()
 	rf.mu.Unlock()
 
 	return rf
@@ -660,6 +653,7 @@ func (rf *RaftServer) startGrpcServer() error {
 	pb.RegisterRaftServiceServer(grpcServer, NewRaftServiceServer(rf))                       // election processes and transaction management
 	pb.RegisterHeartbeatServiceServer(grpcServer, NewHeartbeatServiceServer(rf))             // heartbeat timout handling (issue: channel handling)
 	pb.RegisterReplicateOperationServiceServer(grpcServer, NewReplicateOpsServiceServer(rf)) // leader log commit handling from non-leader nodes
+	pb.RegisterLoadDriverServiceServer(grpcServer, NewLoadDriverServiceServer(rf))           // handle testing with external pod manager
 
 	if err = grpcServer.Serve(lis); err != nil {
 		return fmt.Errorf("failed to serve gRPC on port %s: %v", rf.Transport.Addr(), err)
