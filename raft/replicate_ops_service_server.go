@@ -31,12 +31,12 @@ func (s *ReplicateOpsServiceServer) CommitOperation(context context.Context, txn
 
 func (s *ReplicateOpsServiceServer) ApplyOperation(context context.Context, txn *pb.ApplyOperationRequest) (*pb.ApplyOperationResponse, error) {
 	log.DPrintf("[%s] received (ApplyOperation) from leader", s.raftServer.Transport.Addr())
-	appliedTxn, err := s.raftServer.logfile.ApplyOperation()
+	_, err := s.raftServer.logfile.ApplyOperation()
 	if err != nil {
 		return nil, err
 	}
 	s.raftServer.commitIdx++
-	s.raftServer.applyCh <- appliedTxn
+	// s.raftServer.applyCh <- appliedTxn
 	return nil, nil
 }
 

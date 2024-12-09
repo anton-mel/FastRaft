@@ -3,17 +3,13 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"time"
 
 	"6.824/log"
 	"6.824/raft/pb"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-)
-
-const (
-	node1 = ":1000"
-	node2 = ":1001"
 )
 
 type LoadDriver struct {
@@ -25,11 +21,9 @@ func NewLoadDriver(nodeAddresses []string) (*LoadDriver, error) {
 	var connections []*grpc.ClientConn
 	var clients []pb.LoadDriverServiceClient
 
-	// Connect to each node in nodeAddresses
 	for _, addr := range nodeAddresses {
 		conn, err := grpc.NewClient(
-			addr,
-			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			addr, grpc.WithTransportCredentials(insecure.NewCredentials()),
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect to %s: %w", addr, err)
@@ -50,17 +44,14 @@ func (ld *LoadDriver) Close() {
 func (ld *LoadDriver) ApplyCommand(nodeIndex int, command string) error {
 	client := ld.clients[nodeIndex]
 	_, err := client.ApplyCommand(context.Background(), &pb.ApplyCommandRequest{
-		NodeAddress: "",
-		Command:     command,
+		Command: command,
 	})
 	return err
 }
 
 func (ld *LoadDriver) GetLogs(nodeIndex int) ([]*pb.LogElement, error) {
 	client := ld.clients[nodeIndex]
-	resp, err := client.GetLogs(context.Background(), &pb.GetLogsRequest{
-		NodeAddress: "",
-	})
+	resp, err := client.GetLogs(context.Background(), &pb.GetLogsRequest{})
 	if err != nil {
 		return nil, err
 	}
@@ -70,41 +61,50 @@ func (ld *LoadDriver) GetLogs(nodeIndex int) ([]*pb.LogElement, error) {
 func main() {
 	log.SetDebug(true)
 
-	// List of nodes to connect to
-	nodeAddresses := []string{node1, node2}
+	if len(os.Args) < 2 {
+		log.DPrintf("Usage: load_driver <address> [peer1 peer2 ...]")
+		return
+	}
 
-	// Initialize LoadDriver with multiple node addresses
-	loadDriver, err := NewLoadDriver(nodeAddresses)
+	me := os.Args[1]     // The manager's address
+	peers := os.Args[2:] // The peers' addresses
+
+	log.DPrintf("Starting LoadDriver on %s with peers: %v", me, peers)
+
+	// Initialize LoadDriver
+	loadDriver, err := NewLoadDriver(peers)
 	if err != nil {
 		log.DPrintf("Failed to initialize LoadDriver: %v", err)
 		return
 	}
 	defer loadDriver.Close()
 
-	// Apply commands to both nodes
-	for i := 0; i < 10; i++ {
+	// Apply commands to each peer
+	for i := 0; i < 2; i++ {
 		command := fmt.Sprintf("COMMAND_%d", i)
-		for idx, node := range nodeAddresses {
-			log.DPrintf("Applying command to node [%v]", node)
-			err := loadDriver.ApplyCommand(idx, command)
-			if err != nil {
-				log.DPrintf("Failed to apply command to %s: %v", node, err)
+		for idx, peer := range peers {
+			log.DPrintf("Applying command [%s] to peer %s", command, peer)
+			if err := loadDriver.ApplyCommand(idx, command); err != nil {
+				log.DPrintf("Failed to apply command to %s: %v", peer, err)
+			} else {
+				log.DPrintf("Command [%s] applied to peer %s", command, peer)
 			}
 		}
-		// Slow down if needed
-		time.Sleep(5000 * time.Millisecond)
+		time.Sleep(5 * time.Second)
 	}
 
-	// Fetch logs from both nodes
-	for idx, node := range nodeAddresses {
+	// Fetch logs from each peer
+	for idx, peer := range peers {
 		logs, err := loadDriver.GetLogs(idx)
 		if err != nil {
-			log.DPrintf("Failed to get logs from %s: %v", node, err)
+			log.DPrintf("Failed to get logs from %s: %v", peer, err)
 			continue
 		}
-		log.DPrintf("Logs from node %s:\n", node)
+		log.DPrintf("Logs from peer %s:", peer)
 		for _, logEntry := range logs {
-			log.DPrintf("- Term: %d, Index: %d, Command: %s\n", logEntry.Term, logEntry.Index, logEntry.Command)
+			log.DPrintf("- Term: %d, Index: %d, Command: %s", logEntry.Term, logEntry.Index, logEntry.Command)
 		}
 	}
+
+	time.Sleep(10 * time.Second)
 }

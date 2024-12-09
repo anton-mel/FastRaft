@@ -199,7 +199,7 @@ func (rf *RaftServer) performTwoPhaseCommit(txn *pb.LogElement) error {
 	log.DPrintf("[%s] performing (ApplyOperation) on %d followers", rf.Transport.Addr(), len(rf.ReplicaConnMap))
 
 	rf.commitIdx++ // increment the final commitIndex after applying changes
-	rf.applyCh <- txn
+	// rf.applyCh <- txn
 
 	for _, conn := range rf.ReplicaConnMap {
 		replicateOpsClient := pb.NewReplicateOperationServiceClient(conn)
@@ -406,7 +406,7 @@ func (rf *RaftServer) applyCommittedEntries() {
 
 	for i := rf.appliedLast + 1; i <= rf.commitIdx; i++ {
 		// Get i-th transaction to Apply the Message to a SM
-		txn, err := rf.logfile.GetTransactionWithIndex(i - int(baseTxn.Index))
+		_, err := rf.logfile.GetTransactionWithIndex(i - int(baseTxn.Index))
 		if err != nil {
 			log.DPrintf("[%v] (applyCommittedEntries) Error retrieving transaction at index %d: %v", rf.Transport.Addr(), i, err)
 			continue
@@ -414,7 +414,7 @@ func (rf *RaftServer) applyCommittedEntries() {
 
 		// Send the committed transaction
 		// to the apply channel
-		rf.applyCh <- txn
+		// rf.applyCh <- txn
 	}
 
 	// Update the last applied index
@@ -623,7 +623,7 @@ func (rf *RaftServer) StartRaftServer() error {
 	// function to send as many requests as needed, which
 	// provides more flexibility in unit testing Raft
 	go rf.startGrpcServer()
-	time.Sleep(time.Second * 3) // wait for server to start
+	time.Sleep(time.Second * 5) // wait for server to start
 
 	log.DPrintf("[%s] Raft Server Started 🚀", rf.Transport.Addr())
 
