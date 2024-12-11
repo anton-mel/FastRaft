@@ -2,15 +2,69 @@ package raft
 
 import (
 	"context"
+	"fmt"
 
 	"6.824/log"
 	"6.824/raft/pb"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 type RaftServiceServer struct {
 	pb.UnimplementedRaftServiceServer
 	rf *RaftServer
 }
+
+// Boostrap Serivce
+
+func (s *RaftServiceServer) AddReplica(ctx context.Context, addrInfo *pb.AddrInfo) (*pb.AddrInfoStatus, error) {
+	log.DPrintf("[%s] received (addReplica) request from [%s]", s.rf.Transport.Addr(), addrInfo.Addr)
+
+	if ok := s.rf.ReplicaConnMap[addrInfo.Addr]; ok != nil {
+		// raft server already present
+		log.DPrintf("raft server [%s] present in replicaConnMap", addrInfo.Addr)
+		return &pb.AddrInfoStatus{IsAdded: true}, nil
+	}
+
+	// raft server not present in replicaConnMap,
+	// create a new connection and add it
+	conn, err := grpc.NewClient(
+		addrInfo.Addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+
+	if err != nil {
+		log.DPrintf("[%s] error while creating gRPC client to [%s]", s.rf.Transport.Addr(), addrInfo.Addr)
+		return &pb.AddrInfoStatus{IsAdded: false}, err
+	}
+
+	s.rf.ReplicaConnMapLock.Lock()
+	s.rf.ReplicaConnMap[addrInfo.Addr] = conn
+	s.rf.ReplicaConnMapLock.Unlock()
+
+	return &pb.AddrInfoStatus{IsAdded: true}, nil
+}
+
+// Heartbeat Service
+
+func (s *RaftServiceServer) Heartbeat(ctx context.Context, request *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
+	// this logic executes when leader sends heartbeat to
+	// a follower, the follower will respond with ACK
+	log.DPrintf("[%s] received leader heartbeat", s.rf.Transport.Addr())
+
+	// set leaderAddr
+	s.rf.leaderAddr = request.Addr
+
+	// reset heartbeat timer
+	if s.rf.Heartbeat != nil {
+		s.rf.Heartbeat.Beat()
+		return &pb.HeartbeatResponse{IsAlive: true, Addr: s.rf.Transport.Addr()}, nil
+	}
+	return &pb.HeartbeatResponse{IsAlive: true, Addr: s.rf.Transport.Addr()},
+		fmt.Errorf("replica not ready")
+}
+
+// Ellection Service
 
 func NewRaftServiceServer(rf *RaftServer) *RaftServiceServer {
 	return &RaftServiceServer{rf: rf}
@@ -136,4 +190,41 @@ func (s *RaftServiceServer) RequestVote(ctx context.Context, args *pb.RequestVot
 	}
 
 	return reply, nil
+}
+
+// Replication Service
+
+func (s *RaftServiceServer) CommitOperation(context context.Context, txn *pb.CommitTransaction) (*pb.CommitOperationResponse, error) {
+	log.DPrintf("[%s] received (CommitOperation: %s) from leader", s.rf.Transport.Addr(), txn.Operation)
+	logfileFinalIndex, err := s.rf.logfile.CommitOperation(
+		int(txn.ExpectedFinalIndex),
+		s.rf.commitIdx,
+		&pb.LogElement{Index: int32(txn.Index), Command: txn.Operation, Term: int32(txn.Term)},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &pb.CommitOperationResponse{LogfileFinalIndex: int64(logfileFinalIndex)}, nil
+}
+
+func (s *RaftServiceServer) ApplyOperation(context context.Context, txn *pb.ApplyOperationRequest) (*pb.ApplyOperationResponse, error) {
+	log.DPrintf("[%s] received (ApplyOperation) from leader", s.rf.Transport.Addr())
+	_, err := s.rf.logfile.ApplyOperation()
+	if err != nil {
+		return nil, err
+	}
+	s.rf.commitIdx++
+	// s.raftServer.applyCh <- appliedTxn
+	return nil, nil
+}
+
+func (s *RaftServiceServer) ForwardOperation(context context.Context, in *pb.ForwardOperationRequest) (*pb.ForwardOperationResponse, error) {
+	txn, err := s.rf.convertToTransaction(in.Operation)
+	if err != nil {
+		return nil, err
+	}
+	if err = s.rf.performTwoPhaseCommit(txn); err != nil {
+		return nil, err
+	}
+	return nil, nil
 }

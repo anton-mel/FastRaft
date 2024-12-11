@@ -645,14 +645,9 @@ func (rf *RaftServer) startGrpcServer() error {
 	}
 
 	grpcServer := grpc.NewServer()
-	// register one gRPC server with services per each node.
-	// keep the connections map `ReplicaConnMap` for faster restart
-	// by saving it to the snapshot and fetching when needed (stretch goal)
-	pb.RegisterBootstrapServiceServer(grpcServer, NewBootstrapServiceServer(rf))             // replicate the grpc connection around the peers
-	pb.RegisterRaftServiceServer(grpcServer, NewRaftServiceServer(rf))                       // election processes and transaction management
-	pb.RegisterHeartbeatServiceServer(grpcServer, NewHeartbeatServiceServer(rf))             // heartbeat timout handling (issue: channel handling)
-	pb.RegisterReplicateOperationServiceServer(grpcServer, NewReplicateOpsServiceServer(rf)) // leader log commit handling from non-leader nodes
-	pb.RegisterLoadDriverServiceServer(grpcServer, NewLoadDriverServiceServer(rf))           // handle testing with external pod manager
+	// register one gRPC server with services per each node
+	pb.RegisterRaftServiceServer(grpcServer, NewRaftServiceServer(rf))
+	pb.RegisterLoadDriverServiceServer(grpcServer, NewLoadDriverServiceServer(rf))
 
 	if err = grpcServer.Serve(lis); err != nil {
 		return fmt.Errorf("failed to serve gRPC on port %s: %v", rf.Transport.Addr(), err)
