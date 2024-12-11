@@ -586,7 +586,7 @@ func (rf *RaftServer) bootstrapNetwork() {
 	log.DPrintf("[%s] bootstrapping completed", rf.Transport.Addr())
 }
 
-func MakeRaftServer(me string, applyCh chan *pb.LogElement, peers []string) *RaftServer {
+func MakeRaftServer(me string, peers []string) *RaftServer {
 	rf := &RaftServer{}
 
 	rf.mu.Lock()
@@ -606,7 +606,6 @@ func MakeRaftServer(me string, applyCh chan *pb.LogElement, peers []string) *Raf
 	rf.cWinElection = make(chan struct{}, 1000)
 
 	rf.Transport = &GRPCTransport{ListenAddr: me}
-	rf.applyCh = applyCh
 	rf.logfile = logfile.NewLogfile()
 	rf.ReplicaConnMap = make(map[string]*grpc.ClientConn)
 

@@ -15,6 +15,7 @@ import (
 type LoadDriver struct {
 	connections []*grpc.ClientConn
 	clients     []pb.LoadDriverServiceClient
+	// mu          sync.RWMutex
 }
 
 func NewLoadDriver(nodeAddresses []string) (*LoadDriver, error) {
@@ -71,7 +72,6 @@ func main() {
 
 	log.DPrintf("Starting LoadDriver on %s with peers: %v", me, peers)
 
-	// Initialize LoadDriver
 	loadDriver, err := NewLoadDriver(peers)
 	if err != nil {
 		log.DPrintf("Failed to initialize LoadDriver: %v", err)
@@ -79,7 +79,9 @@ func main() {
 	}
 	defer loadDriver.Close()
 
-	// Apply commands to each peer
+	// TODO: Define load tests here
+
+	// Apply commands
 	for i := 0; i < 2; i++ {
 		command := fmt.Sprintf("COMMAND_%d", i)
 		for idx, peer := range peers {
@@ -93,7 +95,7 @@ func main() {
 		time.Sleep(5 * time.Second)
 	}
 
-	// Fetch logs from each peer
+	// Fetch logs
 	for idx, peer := range peers {
 		logs, err := loadDriver.GetLogs(idx)
 		if err != nil {
