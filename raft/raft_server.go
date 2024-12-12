@@ -11,9 +11,6 @@ import (
 	"6.824/log"
 	"6.824/raft/pb"
 
-	"6.824/raft/heartbeat"
-	"6.824/raft/logfile"
-
 	"golang.org/x/exp/rand"
 	"google.golang.org/grpc"
 )
@@ -25,7 +22,7 @@ const (
 )
 
 type RaftServer struct {
-	role  int      // Current replicas' role
+	state int      // Current replicas' role
 	peers []string // Ports for of all the peers
 	// persister *Persister
 
@@ -40,11 +37,17 @@ type RaftServer struct {
 	numVotes     int
 	votedFor     string
 	cWinElection chan struct{}
+	cHeartbeat   chan struct{}
+
+	connectionsCount   int
+	cBootstrapComplete chan struct{} // avoid split vote when manually launching the nodes
+	// this happens because in the for loop startup there is still timeout allowing one to
+	// become a leader before voting for itself. Otherwise, eveyone is a CANDIDATE that voted
+	// for himself. And since majority cannot be found, this is a deadlock.
 
 	Transport Transport
-	Heartbeat *heartbeat.Heartbeat
 	applyCh   chan *pb.LogElement
-	logfile   *logfile.Logfile
+	log       []*pb.LogElement
 
 	// { address of server, connection client }, we will maintain
 	// the connections and reuse them to reduce latency using
@@ -59,7 +62,7 @@ type RaftServer struct {
 func (rf *RaftServer) GetState() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	return rf.role == LEADER
+	return rf.state == LEADER
 }
 
 // save Raft's persistent state to stable storage,
@@ -91,18 +94,10 @@ func (rf *RaftServer) GetState() bool {
 // 	}
 // }
 
-func (s *RaftServer) convertToTransaction(operation string) (*pb.LogElement, error) {
-	return &pb.LogElement{
-		Index:   int32(s.commitIdx + 1),
-		Term:    int32(s.currentTerm),
-		Command: operation,
-	}, nil
-}
-
 // `sendOperationToLeader` is called when an operation reaches a FOLLOWER.
 // This function forwards the operation to the LEADER
 func sendOperationToLeader(operation string, conn *grpc.ClientConn) error {
-	replicateOpsClient := pb.NewReplicateOperationServiceClient(conn)
+	replicateOpsClient := pb.NewRaftServiceClient(conn)
 	_, err := replicateOpsClient.ForwardOperation(
 		context.Background(),
 		&pb.ForwardOperationRequest{Operation: operation},
@@ -118,25 +113,22 @@ func (rf *RaftServer) PerformOperation(command string) error {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	log.DPrintf("[%v] IF leader: [%v]", rf.Transport.Addr(), isLeader)
+	log.DPrintf("[%v] (PerformOperation) IF leader: [%v]", rf.Transport.Addr(), isLeader)
 
 	// only the LEADER is allowed to perform the operation
 	// and it then replicates that operation across all the nodes.
 	// if the current node is not a LEADER, the operation request
 	// will be forwarded to the LEADER, who will then perform the operation
 	if isLeader {
-		txn, err := rf.convertToTransaction(command)
-		if err != nil {
-			return fmt.Errorf("[%s] error while converting to transaction", rf.Transport.Addr())
-		}
-		return rf.performTwoPhaseCommit(txn)
+		rf.performCommit(command)
+		return nil
 	}
-	log.DPrintf("[%s] forwarding operation (%s) to leader [%s]", rf.Transport.Addr(), command, rf.leaderAddr)
+	log.DPrintf("[%s] (PerformOperation) forwarding operation (%s) to leader [%s]", rf.Transport.Addr(), command, rf.leaderAddr)
 	rf.ReplicaConnMapLock.RLock()
 	defer rf.ReplicaConnMapLock.RUnlock()
 
 	if rf.leaderAddr == "" {
-		log.DPrintf("Leader address is not set, cannot forward command <%v>", command)
+		log.DPrintf("(PerformOperation) Leader address is not set, cannot forward command <%v>", command)
 		return errors.New("leader address is not set")
 	}
 
@@ -145,106 +137,12 @@ func (rf *RaftServer) PerformOperation(command string) error {
 }
 
 // Performs a two phase commit on all the FOLLOWERS
-func (rf *RaftServer) performTwoPhaseCommit(txn *pb.LogElement) error {
-	// since we are planning to commit commands beyond the node
-	// initialization, let's refactor our logfile interface.
-	rf.ReplicaConnMapLock.RLock()
-	wg := &sync.WaitGroup{}
-
-	// First phase of the TwoPhaseCommit: Commit operation
-
-	// CommitOperation on self
-	if _, err := rf.logfile.CommitOperation(rf.commitIdx, rf.commitIdx, txn); err != nil {
-		panic(fmt.Errorf("[%s] %v", rf.Transport.Addr(), err))
-	}
-
-	log.DPrintf("[%s] performing commit operation on %d followers", rf.Transport.Addr(), len(rf.ReplicaConnMap))
-
-	for addr, conn := range rf.ReplicaConnMap {
-		replicateOpsClient := pb.NewReplicateOperationServiceClient(conn)
-		log.DPrintf("[%s] sending (CommitOperation: %s) to [%s]", rf.Transport.Addr(), txn.Command, addr)
-		response, err := replicateOpsClient.CommitOperation(
-			context.Background(),
-			&pb.CommitTransaction{
-				ExpectedFinalIndex: int64(rf.commitIdx),
-				Index:              int64(txn.Index),
-				Operation:          txn.Command,
-				Term:               int64(txn.Term),
-			},
-		)
-		if err != nil {
-			log.DPrintf("[%s] received error in (CommitOperation) from [%s]: %v", rf.Transport.Addr(), addr, err)
-			// if there is both, an error and a response, the FOLLOWER is missing
-			// some logs. So the LEADER will replicate all the missing logs in the FOLLOWER
-			if response != nil {
-				wg.Add(1)
-				go rf.replicateMissingLogs(int(response.LogfileFinalIndex), addr, replicateOpsClient, wg)
-			} else {
-				return err
-			}
-		}
-	}
-
-	// wait for all FOLLOWERS to be consistent
-	wg.Wait()
-
-	// Second phase of the TwoPhaseCommit: Apply operation
-
-	// ApplyOperation on self
-	_, err := rf.logfile.ApplyOperation()
-	if err != nil {
-		panic(err)
-	}
-
-	log.DPrintf("[%s] performing (ApplyOperation) on %d followers", rf.Transport.Addr(), len(rf.ReplicaConnMap))
-
-	rf.commitIdx++ // increment the final commitIndex after applying changes
-	// rf.applyCh <- txn
-
-	for _, conn := range rf.ReplicaConnMap {
-		replicateOpsClient := pb.NewReplicateOperationServiceClient(conn)
-		_, err := replicateOpsClient.ApplyOperation(
-			context.Background(),
-			&pb.ApplyOperationRequest{},
-		)
-		if err != nil {
-			return err
-		}
-	}
-	rf.ReplicaConnMapLock.RUnlock()
-
-	// rf.persist()
-	return nil
-}
-
-// `replicateMissingLogs` makes a FOLLOWER consistent with the leader. This is
-// called when the FOLLOWER is missing some logs and refuses a commit operation
-// request from the LEADER
-func (rf *RaftServer) replicateMissingLogs(startIndex int, addr string, client pb.ReplicateOperationServiceClient, wg *sync.WaitGroup) {
-	defer wg.Done()
-	for {
-		startIndex++
-		txn, err := rf.logfile.GetTransactionWithIndex(startIndex)
-		if err != nil {
-			log.DPrintf("[%s] error fetching (index: %d) from Logfile", rf.Transport.Addr(), startIndex)
-			break
-		}
-		if txn == nil {
-			break
-		}
-		_, err = client.CommitOperation(
-			context.Background(),
-			&pb.CommitTransaction{
-				ExpectedFinalIndex: int64(startIndex),
-				Index:              int64(txn.Index),
-				Operation:          txn.Command,
-				Term:               int64(txn.Term),
-			},
-		)
-		if err != nil {
-			log.DPrintf("[%s] error replicating missing log (index: %d) to [%s]", rf.Transport.Addr(), startIndex, addr)
-		}
-	}
+func (rf *RaftServer) performCommit(command string) {
+	rf.log = append(rf.log, &pb.LogElement{
+		Term:    int32(rf.currentTerm),
+		Command: command,
+		Index:   rf.log[len(rf.log)-1].Index + 1},
+	)
 }
 
 func (rf *RaftServer) sendRequestVote(server string, args *pb.RequestVoteRequest) bool {
@@ -262,7 +160,7 @@ func (rf *RaftServer) sendRequestVote(server string, args *pb.RequestVoteRequest
 	raftClient := pb.NewRaftServiceClient(conn)
 
 	// Execute gRPC call
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	grpcReply, err := raftClient.RequestVote(ctx, args)
@@ -271,11 +169,12 @@ func (rf *RaftServer) sendRequestVote(server string, args *pb.RequestVoteRequest
 		return false
 	}
 
+	// dont lock on blocking io
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
 	// Process gRPC response
-	if rf.currentTerm != int(args.Term) || rf.role != CANDIDATE {
+	if rf.currentTerm != int(args.Term) || rf.state != CANDIDATE {
 		log.DPrintf("[%v] (sendRequestVote) is not a candidate or behind arg term", rf.Transport.Addr())
 		return true
 	}
@@ -283,7 +182,7 @@ func (rf *RaftServer) sendRequestVote(server string, args *pb.RequestVoteRequest
 		log.DPrintf("[%v] (sendRequestVote) Updating my term to %d", rf.Transport.Addr(), grpcReply.Term)
 		rf.votedFor = ""
 		rf.currentTerm = int(grpcReply.Term)
-		rf.role = FOLLOWER
+		rf.state = FOLLOWER
 		return true
 	}
 	if grpcReply.VoteGranted {
@@ -292,18 +191,13 @@ func (rf *RaftServer) sendRequestVote(server string, args *pb.RequestVoteRequest
 		if rf.numVotes > len(rf.peers)/2 {
 			log.DPrintf("[%v] (sendRequestVote) Won election", rf.Transport.Addr())
 			// rf.persist()
-			lastTxn, _ := rf.logfile.GetFinalTransaction()
-			nextIdx := lastTxn.Index + 1
+			nextIdx := rf.log[len(rf.log)-1].Index + 1
 			for _, addr := range rf.peers {
 				rf.nextIdx[addr] = int(nextIdx)
 			}
-			rf.role = LEADER
+			rf.state = LEADER
 			rf.leaderAddr = rf.Transport.Addr()
 			rf.cWinElection <- struct{}{}
-			// if the replica becomes a LEADER, it does not need to listen
-			// for heartbeat from other replicas anymore, so stop the
-			// heartbeat timeout process
-			rf.Heartbeat.Stop()
 		}
 	}
 
@@ -327,7 +221,7 @@ func (rf *RaftServer) sendAppendEntries(server string, grpcArgs *pb.AppendEntrie
 	raftClient := pb.NewRaftServiceClient(conn)
 
 	// Execute gRPC call
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
 	grpcReply, err := raftClient.AppendEntries(ctx, grpcArgs)
@@ -344,7 +238,8 @@ func (rf *RaftServer) sendAppendEntries(server string, grpcArgs *pb.AppendEntrie
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	if rf.currentTerm != int(grpcArgs.Term) || rf.role != LEADER {
+	baseIdx := int(rf.log[0].Index)
+	if rf.currentTerm != int(grpcArgs.Term) || rf.state != LEADER {
 		// Log if the role/term has changed
 		log.DPrintf("[%v] (sendAppendEntries) Not a leader or term mismatch during RPC to %s", rf.Transport.Addr(), server)
 		return
@@ -353,17 +248,17 @@ func (rf *RaftServer) sendAppendEntries(server string, grpcArgs *pb.AppendEntrie
 	if rf.currentTerm < int(reply.Term) {
 		log.DPrintf("[%v] (sendAppendEntries) Other node has later term %d. Becoming follower ", rf.Transport.Addr(), reply.Term)
 		// Update to follower if term mismatch
-		rf.currentTerm = int(reply.Term)
-		rf.role = FOLLOWER
 		rf.votedFor = ""
+		rf.currentTerm = int(reply.Term)
+		rf.state = FOLLOWER
 		// rf.persist()
 		return
 	}
 	if reply.Success {
 		// Successful log replication
 		if len(grpcArgs.Entries) > 0 {
-			rf.matchIdx[server] = int(grpcArgs.Entries[len(grpcArgs.Entries)-1].Index)
-			rf.nextIdx[server] = rf.matchIdx[server] + 1
+			rf.nextIdx[server] = int(grpcArgs.Entries[len(grpcArgs.Entries)-1].Index) + 1
+			rf.matchIdx[server] = rf.nextIdx[server] - 1
 		}
 	} else {
 		// Adjust next index for failed replication
@@ -371,15 +266,10 @@ func (rf *RaftServer) sendAppendEntries(server string, grpcArgs *pb.AppendEntrie
 	}
 
 	// Update commit index based on quorum
-	last_log, err := rf.logfile.GetFinalTransaction()
-	if err != nil {
-		log.DPrintf("[%v] (sendAppendEntries) Error retrieving final transaction: %v", rf.Transport.Addr(), err)
-		return
-	}
-	for i := int(last_log.Index); i > rf.commitIdx; i-- {
+	for i := int(rf.log[len(rf.log)-1].Index); i > rf.commitIdx && rf.currentTerm == int(rf.log[i-baseIdx].Term); i-- {
 		count := 1
-		for _, match := range rf.matchIdx {
-			if match >= i {
+		for peer, match := range rf.matchIdx {
+			if match >= i && peer != rf.Transport.Addr() {
 				count++
 			}
 		}
@@ -397,21 +287,9 @@ func (rf *RaftServer) applyCommittedEntries() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	// Get the base transaction
-	baseTxn, err := rf.logfile.GetTransactionWithIndex(0)
-	if err != nil {
-		log.DPrintf("[%v] (applyCommittedEntries) Error retrieving base transaction: %v", rf.Transport.Addr(), err)
-		return
-	}
-
 	for i := rf.appliedLast + 1; i <= rf.commitIdx; i++ {
 		// Get i-th transaction to Apply the Message to a SM
-		_, err := rf.logfile.GetTransactionWithIndex(i - int(baseTxn.Index))
-		if err != nil {
-			log.DPrintf("[%v] (applyCommittedEntries) Error retrieving transaction at index %d: %v", rf.Transport.Addr(), i, err)
-			continue
-		}
-
+		// command := rf.log[i-int(rf.log[0].Index)].Command
 		// Send the committed transaction
 		// to the apply channel
 		// rf.applyCh <- txn
@@ -427,15 +305,10 @@ func (rf *RaftServer) broadcastHeartbeat() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	log.DPrintf("[%s] sending heartbeat to %d followers", rf.Transport.Addr(), len(rf.ReplicaConnMap))
-	baseIdx := 0
-
-	// Get the base index of the log
-	if txn, err := rf.logfile.GetFinalTransaction(); err == nil && txn != nil {
-		baseIdx = int(txn.Index)
-	}
+	baseIdx := rf.log[0].Index
 
 	for _, peerAddr := range rf.peers {
-		if rf.role == LEADER && peerAddr != rf.Transport.Addr() {
+		if rf.state == LEADER && peerAddr != rf.Transport.Addr() {
 			// Get the next index for this peer
 			nextIdx, exists := rf.nextIdx[peerAddr]
 			if !exists {
@@ -443,7 +316,7 @@ func (rf *RaftServer) broadcastHeartbeat() {
 				return
 			}
 
-			if nextIdx <= baseIdx {
+			if nextIdx <= int(baseIdx) {
 				// snapshot? but not necessary for lab
 				// continue
 			} else {
@@ -456,21 +329,13 @@ func (rf *RaftServer) broadcastHeartbeat() {
 				}
 
 				// Set the previous log term if applicable
-				if int(args.PrevLogIdx) >= baseIdx {
-					if txn, err := rf.logfile.GetTransactionWithIndex(int(args.PrevLogIdx) - baseIdx); err == nil {
-						args.PrevLogTerm = int32(txn.Term)
-					}
+				if args.PrevLogIdx >= baseIdx {
+					args.PrevLogTerm = rf.log[args.PrevLogIdx-baseIdx].Term
 				}
 
 				// Append log entries if there are new entries
-				if nextIdx <= rf.logfile.Size() {
-					entries := make([]*pb.LogElement, 0)
-					for idx := nextIdx - baseIdx; idx < rf.logfile.Size(); idx++ {
-						if txn, err := rf.logfile.GetTransactionWithIndex(idx); err == nil {
-							entries = append(entries, txn)
-						}
-					}
-					args.Entries = entries
+				if nextIdx <= int(rf.log[len(rf.log)-1].Index) {
+					args.Entries = rf.log[nextIdx-int(baseIdx):]
 				}
 
 				// Send AppendEntries RPC in a separate goroutine
@@ -485,26 +350,21 @@ func (rf *RaftServer) broadcastHeartbeat() {
 func (rf *RaftServer) ticker() {
 	for { // state switch process
 		rf.mu.Lock()
-		switch rf.role {
+		switch rf.state {
 		case FOLLOWER:
+			log.DPrintf("[%v] (ticker) FOLLOWER in term %d", rf.Transport.Addr(), rf.currentTerm)
 			rf.mu.Unlock()
-			// start the heartbeat timeout
-			// only if not already set
-			if rf.Heartbeat == nil {
-				log.DPrintf("[%s] FOLLOWER: Starting timeout", rf.Transport.Addr())
-				// this is not needed, since we are anyways working in the real environment
-				timeoutHeartbeat := time.Duration(rand.Intn(200)+1100) * time.Millisecond
-				rf.Heartbeat = heartbeat.NewHeartbeat(timeoutHeartbeat, func() {
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
-					log.DPrintf("[%s] FOLLOWER timeout expired, becoming CANDIDATE", rf.Transport.Addr())
-					rf.role = CANDIDATE
-					// rf.persist()
-				})
-			} else if rf.Heartbeat.Expired() {
-				// if the timout is stopped,
-				// restart (from LEADER/CANDIDATE)
-				rf.Heartbeat.Beat()
+
+			select {
+			case <-time.After(time.Duration(rand.Intn(5000)+1100) * time.Millisecond):
+				rf.mu.Lock()
+				rf.state = CANDIDATE
+				// rf.persist()
+				rf.mu.Unlock()
+			case <-rf.cHeartbeat:
+				rf.mu.Lock()
+				log.DPrintf("[%v] (ticker) Received heartbeat", rf.Transport.Addr())
+				rf.mu.Unlock()
 			}
 
 		case CANDIDATE:
@@ -520,23 +380,22 @@ func (rf *RaftServer) ticker() {
 
 			select {
 			case <-rf.cWinElection:
-				log.DPrintf("[%v] Became Leader", rf.Transport.Addr())
+			case <-time.After(time.Duration(rand.Intn(5000)+600) * time.Millisecond):
 				rf.mu.Lock()
-				rf.role = LEADER
+				rf.state = FOLLOWER
 				rf.mu.Unlock()
-			case <-time.After(time.Duration(rand.Intn(200)+600) * time.Millisecond):
-				log.DPrintf("[%v] Became Follower", rf.Transport.Addr())
+			case <-rf.cHeartbeat:
 				rf.mu.Lock()
-				rf.role = FOLLOWER
+				rf.state = FOLLOWER
+				log.DPrintf("[%v] (ticker) Received heartbeat", rf.Transport.Addr())
 				rf.mu.Unlock()
 			}
 
 		case LEADER:
+			log.DPrintf("[%v] (ticker) LEADER in term %d", rf.Transport.Addr(), rf.currentTerm)
 			rf.mu.Unlock()
-			// the LEADER will send heartbeat to the FOLLOWERS
 			go rf.broadcastHeartbeat()
 			// rf.persist()
-
 			// limited to 10 heartbeats per second
 			time.Sleep(100 * time.Millisecond)
 		}
@@ -546,16 +405,13 @@ func (rf *RaftServer) ticker() {
 // `startElection` sends RequestVote RPCs to peers.
 func (rf *RaftServer) startElection() {
 	rf.mu.Lock()
-
-	lastLog, _ := rf.logfile.GetFinalTransaction()
 	args := pb.RequestVoteRequest{
 		Term:          int32(rf.currentTerm),
 		CandidatePort: rf.Transport.Addr(),
-		LastLogIdx:    lastLog.Index,
-		LastLogTerm:   lastLog.Term,
+		LastLogIdx:    rf.log[len(rf.log)-1].Index,
+		LastLogTerm:   rf.log[len(rf.log)-1].Term,
 	}
 	rf.mu.Unlock()
-
 	for _, addr := range rf.peers {
 		if addr != rf.Transport.Addr() {
 			go func(addr string) {
@@ -568,29 +424,52 @@ func (rf *RaftServer) startElection() {
 // Sends requests to other replicas so that they can add this
 // server to their replicaConnMap (establish gRPC connection)
 func (rf *RaftServer) bootstrapNetwork() {
-	wg := &sync.WaitGroup{}
-	for _, addr := range rf.peers {
-		wg.Add(1)
-		if len(addr) == 0 {
-			continue
-		}
-		go func(s *RaftServer, addr string, wg *sync.WaitGroup) {
-			log.DPrintf("[%s] attempting to connect with [%s]", rf.Transport.Addr(), addr)
-			if err := rf.Transport.Dial(s, addr); err != nil {
-				log.DPrintf("[%s]: dial error while connecting to [%s]: %v", rf.Transport.Addr(), addr, err)
+	// If there are no peers initially, wait for connections
+	if len(rf.peers) == 0 {
+		log.DPrintf("[%s] No initial peers. Waiting for incoming connections...", rf.Transport.Addr())
+		for {
+			rf.mu.Lock()
+			if rf.connectionsCount > 0 {
+				log.DPrintf("[%s] Received at least one connection. Proceeding...", rf.Transport.Addr())
+				rf.mu.Unlock()
+				break
 			}
-			wg.Done()
-		}(rf, addr, wg)
+			rf.mu.Unlock()
+			time.Sleep(100 * time.Millisecond) // Avoid busy waiting
+		}
+	} else {
+		// Try connecting to the specified peers
+		wg := &sync.WaitGroup{}
+		for _, addr := range rf.peers {
+			if len(addr) == 0 {
+				continue
+			}
+			wg.Add(1)
+			go func(addr string) {
+				defer wg.Done()
+				log.DPrintf("[%s] Attempting to connect with [%s]", rf.Transport.Addr(), addr)
+				if err := rf.Transport.Dial(rf, addr); err == nil {
+					rf.mu.Lock()
+					rf.connectionsCount++
+					rf.mu.Unlock()
+				} else {
+					log.DPrintf("[%s]: Dial error while connecting to [%s]: %v", rf.Transport.Addr(), addr, err)
+				}
+			}(addr)
+		}
+		wg.Wait()
 	}
-	wg.Wait()
-	log.DPrintf("[%s] bootstrapping completed", rf.Transport.Addr())
+
+	// Signal that bootstrapping is complete
+	log.DPrintf("[%s] Bootstrapping completed with %d connections", rf.Transport.Addr(), rf.connectionsCount)
+	close(rf.cBootstrapComplete)
 }
 
 func MakeRaftServer(me string, peers []string) *RaftServer {
 	rf := &RaftServer{}
 
 	rf.mu.Lock()
-	rf.role = FOLLOWER
+	rf.state = FOLLOWER
 	rf.peers = peers
 	// rf.persister = persister
 
@@ -604,9 +483,12 @@ func MakeRaftServer(me string, peers []string) *RaftServer {
 	rf.numVotes = 0
 	rf.votedFor = ""
 	rf.cWinElection = make(chan struct{}, 1000)
+	rf.cHeartbeat = make(chan struct{}, 1000)
+	rf.cBootstrapComplete = make(chan struct{}, 10)
+	rf.connectionsCount = 0
 
 	rf.Transport = &GRPCTransport{ListenAddr: me}
-	rf.logfile = logfile.NewLogfile()
+	rf.log = append(rf.log, &pb.LogElement{Term: 0, Command: "", Index: 0})
 	rf.ReplicaConnMap = make(map[string]*grpc.ClientConn)
 
 	// rf.readPersist(persister.ReadRaftState())
@@ -622,13 +504,17 @@ func (rf *RaftServer) StartRaftServer() error {
 	// function to send as many requests as needed, which
 	// provides more flexibility in unit testing Raft
 	go rf.startGrpcServer()
-	time.Sleep(time.Second * 5) // wait for server to start
+	time.Sleep(time.Second * 3) // wait for server to start
 
 	log.DPrintf("[%s] Raft Server Started 🚀", rf.Transport.Addr())
 
 	// send request to bootstrapped servers to
 	// add this to replica to their `replicaConnMap`
 	rf.bootstrapNetwork()
+
+	// Wait for bootstrapping to complete
+	// before starting ticker process
+	<-rf.cBootstrapComplete
 
 	// start elections after
 	// all grpc are setted up
@@ -645,14 +531,7 @@ func (rf *RaftServer) startGrpcServer() error {
 	}
 
 	grpcServer := grpc.NewServer()
-	// register one gRPC server with services per each node.
-	// keep the connections map `ReplicaConnMap` for faster restart
-	// by saving it to the snapshot and fetching when needed (stretch goal)
-	pb.RegisterBootstrapServiceServer(grpcServer, NewBootstrapServiceServer(rf))             // replicate the grpc connection around the peers
-	pb.RegisterRaftServiceServer(grpcServer, NewRaftServiceServer(rf))                       // election processes and transaction management
-	pb.RegisterHeartbeatServiceServer(grpcServer, NewHeartbeatServiceServer(rf))             // heartbeat timout handling (issue: channel handling)
-	pb.RegisterReplicateOperationServiceServer(grpcServer, NewReplicateOpsServiceServer(rf)) // leader log commit handling from non-leader nodes
-	pb.RegisterLoadDriverServiceServer(grpcServer, NewLoadDriverServiceServer(rf))           // handle testing with external pod manager
+	pb.RegisterRaftServiceServer(grpcServer, NewRaftServiceServer(rf))
 
 	if err = grpcServer.Serve(lis); err != nil {
 		return fmt.Errorf("failed to serve gRPC on port %s: %v", rf.Transport.Addr(), err)

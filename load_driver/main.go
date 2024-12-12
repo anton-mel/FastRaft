@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"time"
 
 	"6.824/log"
 	"6.824/raft/pb"
@@ -14,13 +13,12 @@ import (
 
 type LoadDriver struct {
 	connections []*grpc.ClientConn
-	clients     []pb.LoadDriverServiceClient
-	// mu          sync.RWMutex
+	clients     []pb.RaftServiceClient
 }
 
 func NewLoadDriver(nodeAddresses []string) (*LoadDriver, error) {
 	var connections []*grpc.ClientConn
-	var clients []pb.LoadDriverServiceClient
+	var clients []pb.RaftServiceClient
 
 	for _, addr := range nodeAddresses {
 		conn, err := grpc.NewClient(
@@ -30,7 +28,7 @@ func NewLoadDriver(nodeAddresses []string) (*LoadDriver, error) {
 			return nil, fmt.Errorf("failed to connect to %s: %w", addr, err)
 		}
 		connections = append(connections, conn)
-		clients = append(clients, pb.NewLoadDriverServiceClient(conn))
+		clients = append(clients, pb.NewRaftServiceClient(conn))
 	}
 
 	return &LoadDriver{connections: connections, clients: clients}, nil
@@ -82,7 +80,7 @@ func main() {
 	// TODO: Define load tests here
 
 	// Apply commands
-	for i := 0; i < 2; i++ {
+	for i := 0; i < 20; i++ {
 		command := fmt.Sprintf("COMMAND_%d", i)
 		for idx, peer := range peers {
 			log.DPrintf("Applying command [%s] to peer %s", command, peer)
@@ -92,7 +90,6 @@ func main() {
 				log.DPrintf("Command [%s] applied to peer %s", command, peer)
 			}
 		}
-		time.Sleep(5 * time.Second)
 	}
 
 	// Fetch logs
@@ -107,6 +104,4 @@ func main() {
 			log.DPrintf("- Term: %d, Index: %d, Command: %s", logEntry.Term, logEntry.Index, logEntry.Command)
 		}
 	}
-
-	time.Sleep(10 * time.Second)
 }

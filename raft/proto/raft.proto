@@ -2,6 +2,28 @@ syntax = "proto3";
 package proto;
 option go_package = "./pb";
 
+
+// Raft service definition
+service RaftService {
+  rpc addReplica(AddrInfo) returns (AddrInfoStatus) {}
+  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
+  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+  rpc ApplyCommand (ApplyCommandRequest) returns (ApplyCommandResponse);
+  rpc GetLogs (GetLogsRequest) returns (GetLogsResponse);
+  rpc CommitOperation(CommitTransaction) returns (CommitOperationResponse) {}
+  rpc ApplyOperation(ApplyOperationRequest) returns (ApplyOperationResponse) {}
+  rpc ForwardOperation(ForwardOperationRequest) returns (ForwardOperationResponse) {}
+}
+
+
+/// Bootstrap Service
+
+message AddrInfoStatus { bool isAdded = 1; }
+message AddrInfo { string addr = 1; }
+
+
+/// Election Service
+
 // Log entry structure
 message LogElement {
   int32 index = 1;
@@ -41,8 +63,37 @@ message RequestVoteResponse {
   bool voteGranted = 2;
 }
 
-// Raft service definition
-service RaftService {
-  rpc AppendEntries(AppendEntriesRequest) returns (AppendEntriesResponse);
-  rpc RequestVote(RequestVoteRequest) returns (RequestVoteResponse);
+
+/// Load Driver Service
+
+message ApplyCommandRequest {
+  string node_address = 1;
+  string command = 2;
 }
+
+message ApplyCommandResponse {
+  bool success = 1;
+}
+
+message GetLogsRequest {
+  string node_address = 1;
+}
+
+message GetLogsResponse {
+  repeated proto.LogElement logs = 1;
+}
+
+
+/// Replication Service
+message CommitTransaction {
+  int64 expectedFinalIndex = 1;
+  int64 index = 2;
+  string operation = 3;
+  int64 term = 4;
+}
+
+message CommitOperationResponse { int64 logfileFinalIndex = 1; }
+message ApplyOperationRequest {}
+message ApplyOperationResponse {}
+message ForwardOperationRequest { string operation = 1; }
+message ForwardOperationResponse {}

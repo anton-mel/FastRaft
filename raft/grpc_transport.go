@@ -30,7 +30,7 @@ func (t *GRPCTransport) Dial(s *RaftServer, addr string) error {
 		return fmt.Errorf("could not connect to raft replica: %v", err)
 	}
 
-	bootstrapServiceClient := pb.NewBootstrapServiceClient(conn)
+	bootstrapServiceClient := pb.NewRaftServiceClient(conn)
 	response, err := bootstrapServiceClient.AddReplica(
 		context.Background(),
 		&pb.AddrInfo{Addr: t.Addr()},
