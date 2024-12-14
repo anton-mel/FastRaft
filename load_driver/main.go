@@ -7,6 +7,8 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
+	"time"
 
 	"6.824/log"
 	"6.824/raft/pb"
@@ -110,9 +112,7 @@ func main() {
 		log.DPrintf("Failed to initialize LoadDriver: %v", err)
 		return
 	}
-	defer loadDriver.Close()
-
-	// TODO: Define load tests here
+	// defer loadDriver.Close()
 
 	// Apply commands
 	for i := 0; i < 20; i++ {
@@ -129,6 +129,8 @@ func main() {
 		// }
 	}
 
+	time.Sleep(3 * time.Second)
+
 	// Fetch logs
 	for idx, peer := range peers {
 		logs, err := loadDriver.GetLogs(idx)
@@ -141,4 +143,55 @@ func main() {
 			log.DPrintf("- Term: %d, Index: %d, Command: %s", logEntry.Term, logEntry.Index, logEntry.Command)
 		}
 	}
+
+	// logic to compare outputs of pod logs
+
+	// TODO: load test pods here; throughout, response times, errors should be measured
+
+	numThreads := 20
+	numCommandsPerThread := 50
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	totalErrors := 0
+	totalCommands := 0
+	totalResponseTime := time.Duration(0)
+
+	wg.Add(numThreads)
+	for i := 0; i < numThreads; i++ {
+		go func(threadID int) {
+			defer wg.Done()
+
+			for j := 0; j < numCommandsPerThread; j++ {
+				command := fmt.Sprintf("THREAD_%d_COMMAND_%d", threadID, j)
+				nodeIndex := rand.Intn(len(peers))
+				peer := peers[nodeIndex]
+
+				startTime := time.Now()
+				err := loadDriver.ApplyCommand(nodeIndex, command)
+				responseTime := time.Since(startTime)
+
+				mu.Lock()
+				totalCommands++
+				totalResponseTime += responseTime
+				if err != nil {
+					totalErrors++
+					log.DPrintf("Thread %d: Failed to apply command to %s: %v", threadID, peer, err)
+				} else {
+					log.DPrintf("Thread %d: Command [%s] applied to peer %s in %v", threadID, command, peer, responseTime)
+				}
+				mu.Unlock()
+			}
+		}(i)
+	}
+
+	wg.Wait()
+
+	averageResponseTime := totalResponseTime / time.Duration(totalCommands)
+	log.DPrintf("Load Test Complete")
+	log.DPrintf("Total Commands Sent: %d", totalCommands)
+	log.DPrintf("Total Errors: %d", totalErrors)
+	log.DPrintf("Average Response Time: %v", averageResponseTime)
+
+	loadDriver.Close()
 }

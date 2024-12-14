@@ -30,7 +30,9 @@ RUN chmod +x entrypoint.sh
 
 EXPOSE 5000
 
-ENTRYPOINT [ "./entrypoint.sh" ]
+CMD ["sh", "-c", "while true; do sleep 3600; done"]
+
+# ENTRYPOINT [ "./entrypoint.sh" ]
 
 # ENTRYPOINT [ "./app", "ME=${SELF_IP}:5000", "PEERS_IP=${PEERS_IP}"] 
 
