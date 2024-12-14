@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"sync"
 	"time"
@@ -21,9 +22,13 @@ const (
 	LEADER
 )
 
+// [Fast Raft] requires a larger
+// quorum for the fast path.
+const FAST_QUORUM_FACTOR = 0.75
+
 type RaftServer struct {
 	state int      // Current replicas' role
-	peers []string // Ports for of all the peers
+	peers []string // now IP:port for of all the peers
 	// persister *Persister
 
 	leaderAddr  string
@@ -31,8 +36,11 @@ type RaftServer struct {
 	appliedLast int
 	commitIdx   int
 
-	nextIdx  map[string]int // only for leaders
-	matchIdx map[string]int // only for leaders
+	lastLeaderIndex int // [Fast Raft]
+
+	nextIdx         map[string]int // only for leaders
+	matchIdx        map[string]int // only for leaders
+	possibleEntries map[string]int // only for leaders [Fast Raft]
 
 	numVotes     int
 	votedFor     string
@@ -63,6 +71,12 @@ func (rf *RaftServer) GetState() bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.state == LEADER
+}
+
+// [Fast Raft] return a sufficient for leader
+// quorum size to commit entry e given M sites (>=3M/4).
+func (rf *RaftServer) fastQuorumSize() int {
+	return int(math.Ceil(float64(len(rf.peers)) * FAST_QUORUM_FACTOR))
 }
 
 // save Raft's persistent state to stable storage,
@@ -113,36 +127,37 @@ func (rf *RaftServer) PerformOperation(command string) error {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	log.DPrintf("[%v] (PerformOperation) IF leader: [%v]", rf.Transport.Addr(), isLeader)
+	log.DPrintf("[%v] (PerformOperation) Is Leader: [%v]", rf.Transport.Addr(), isLeader)
 
-	// only the LEADER is allowed to perform the operation
-	// and it then replicates that operation across all the nodes.
-	// if the current node is not a LEADER, the operation request
-	// will be forwarded to the LEADER, who will then perform the operation
 	if isLeader {
-		rf.performCommit(command)
+		// Leader directly appends the entry and starts replication
+		rf.performCommit(command, "leader")
 		return nil
+	} else {
+		// [Fast Raft] In Fast Raft, non-leader nodes can receive and process
+		// proposals directly from clients. This is different from traditional
+		// Raft, where all proposals go through the leader.
+		rf.performCommit(command, "self")
+		log.DPrintf("[%s] (PerformOperation) forwarding operation (%s) to leader [%s]", rf.Transport.Addr(), command, rf.leaderAddr)
+		rf.ReplicaConnMapLock.RLock()
+		defer rf.ReplicaConnMapLock.RUnlock()
+		if rf.leaderAddr == "" {
+			// Ensure that leaderAddr is replicated (look AppendEntries)
+			log.DPrintf("(PerformOperation) Leader address is not set, cannot forward command <%v>", command)
+			return errors.New("leader address is not set")
+		}
+		return sendOperationToLeader(command, rf.ReplicaConnMap[rf.leaderAddr])
 	}
-	log.DPrintf("[%s] (PerformOperation) forwarding operation (%s) to leader [%s]", rf.Transport.Addr(), command, rf.leaderAddr)
-	rf.ReplicaConnMapLock.RLock()
-	defer rf.ReplicaConnMapLock.RUnlock()
-
-	if rf.leaderAddr == "" {
-		log.DPrintf("(PerformOperation) Leader address is not set, cannot forward command <%v>", command)
-		return errors.New("leader address is not set")
-	}
-
-	// sending operation to the LEADER to perform a TwoPhaseCommit
-	return sendOperationToLeader(command, rf.ReplicaConnMap[rf.leaderAddr])
 }
 
 // Performs a two phase commit on all the FOLLOWERS
-func (rf *RaftServer) performCommit(command string) {
+func (rf *RaftServer) performCommit(command string, insertedBy string) {
 	rf.log = append(rf.log, &pb.LogElement{
-		Term:    int32(rf.currentTerm),
-		Command: command,
-		Index:   rf.log[len(rf.log)-1].Index + 1},
-	)
+		Term:       int32(rf.currentTerm),
+		Command:    command,
+		Index:      rf.log[len(rf.log)-1].Index + 1,
+		InsertedBy: insertedBy, // [Fast Raft] either self or leader
+	})
 }
 
 func (rf *RaftServer) sendRequestVote(server string, args *pb.RequestVoteRequest) bool {
@@ -402,6 +417,17 @@ func (rf *RaftServer) ticker() {
 	}
 }
 
+// [Fast Raft] ????????
+func (rf *RaftServer) countVotes(index int) int {
+	votes := 0
+	// for _, peer := range rf.peers {
+	// 	if rf.matchIndex[peer] >= index {
+	// 		votes++
+	// 	}
+	// }
+	return votes
+}
+
 // `startElection` sends RequestVote RPCs to peers.
 func (rf *RaftServer) startElection() {
 	rf.mu.Lock()
@@ -477,8 +503,11 @@ func MakeRaftServer(me string, peers []string) *RaftServer {
 	rf.appliedLast = 0
 	rf.commitIdx = 0
 
+	rf.lastLeaderIndex = 0
+
 	rf.nextIdx = make(map[string]int)
 	rf.matchIdx = make(map[string]int)
+	rf.possibleEntries = make(map[string]int)
 
 	rf.numVotes = 0
 	rf.votedFor = ""
@@ -488,7 +517,7 @@ func MakeRaftServer(me string, peers []string) *RaftServer {
 	rf.connectionsCount = 0
 
 	rf.Transport = &GRPCTransport{ListenAddr: me}
-	rf.log = append(rf.log, &pb.LogElement{Term: 0, Command: "", Index: 0})
+	rf.log = append(rf.log, &pb.LogElement{Term: 0, Command: "", Index: 0, InsertedBy: "leader"})
 	rf.ReplicaConnMap = make(map[string]*grpc.ClientConn)
 
 	// rf.readPersist(persister.ReadRaftState())

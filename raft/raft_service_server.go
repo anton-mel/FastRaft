@@ -114,7 +114,7 @@ func (s *RaftServiceServer) AppendEntries(ctx context.Context, args *pb.AppendEn
 				s.rf.mu.Lock()
 				defer s.rf.mu.Unlock()
 				for i := s.rf.appliedLast + 1; i <= s.rf.commitIdx; i++ {
-					s.rf.performCommit(s.rf.log[i-int(s.rf.log[0].Index)].Command)
+					s.rf.performCommit(s.rf.log[i-int(s.rf.log[0].Index)].Command, "leader")
 					// msg := ApplyMsg{CommandValid: true, Command: s.rf.log[i-s.rf.log[0].Index].Command, CommandIndex: i}
 					// s.rf.cApplyMsg <- msg
 				}
@@ -183,9 +183,10 @@ func (s *RaftServiceServer) CommitOperation(context context.Context, txn *pb.Com
 	}
 
 	newLogEntry := &pb.LogElement{
-		Index:   int32(txn.Index),
-		Command: txn.Operation,
-		Term:    int32(txn.Term),
+		Index:      int32(txn.Index),
+		Command:    txn.Operation,
+		Term:       int32(txn.Term),
+		InsertedBy: "leader",
 	}
 	s.rf.log = append(s.rf.log, newLogEntry)
 
@@ -208,6 +209,6 @@ func (s *RaftServiceServer) ApplyOperation(ctx context.Context, txn *pb.ApplyOpe
 }
 
 func (s *RaftServiceServer) ForwardOperation(ctx context.Context, in *pb.ForwardOperationRequest) (*pb.ForwardOperationResponse, error) {
-	s.rf.performCommit(in.Operation)
+	s.rf.performCommit(in.Operation, "leader")
 	return &pb.ForwardOperationResponse{}, nil
 }
