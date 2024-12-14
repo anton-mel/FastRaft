@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"fmt"
+	"math/rand"
+	"net"
 	"os"
+	"strings"
 
 	"6.824/log"
 	"6.824/raft/pb"
@@ -57,6 +60,27 @@ func (ld *LoadDriver) GetLogs(nodeIndex int) ([]*pb.LogElement, error) {
 	return resp.Logs, nil
 }
 
+func resolveToIP(service string) (string, error) {
+	parts := strings.Split(service, ":")
+	if len(parts) != 2 {
+		return "", fmt.Errorf("invalid service format, expected hostname:port")
+	}
+
+	hostname := parts[0]
+	port := parts[1]
+
+	ips, err := net.LookupHost(hostname)
+	if err != nil {
+		if len(ips) == 0 {
+			return "", fmt.Errorf("failed to resolve hostname %s: %v", hostname, err)
+		} else {
+			return ips[0], fmt.Errorf("failed to resolve hostname %s: %v", hostname, err)
+		}
+	}
+
+	return fmt.Sprintf("%s:%s", ips[0], port), nil
+}
+
 func main() {
 	log.SetDebug(true)
 
@@ -65,10 +89,21 @@ func main() {
 		return
 	}
 
-	me := os.Args[1]     // The manager's address
-	peers := os.Args[2:] // The peers' addresses
+	me := os.Args[1][3:]                             // The manager's address
+	peersInput := strings.Split(os.Args[2][6:], ",") // The peers' addresses
 
-	log.DPrintf("Starting LoadDriver on %s with peers: %v", me, peers)
+	log.DPrintf("Starting LoadDriver on %s with peers:", me)
+	peers := []string{}
+	for _, peer := range peersInput {
+		// resolve to IP addr,
+		ip, err := resolveToIP(peer)
+		if err != nil {
+			log.DPrintf("Failed to resolve %s to IP: %v", peer, err)
+			continue
+		}
+		peers = append(peers, ip)
+		log.DPrintf("- %s", ip)
+	}
 
 	loadDriver, err := NewLoadDriver(peers)
 	if err != nil {
@@ -82,14 +117,16 @@ func main() {
 	// Apply commands
 	for i := 0; i < 20; i++ {
 		command := fmt.Sprintf("COMMAND_%d", i)
-		for idx, peer := range peers {
-			log.DPrintf("Applying command [%s] to peer %s", command, peer)
-			if err := loadDriver.ApplyCommand(idx, command); err != nil {
-				log.DPrintf("Failed to apply command to %s: %v", peer, err)
-			} else {
-				log.DPrintf("Command [%s] applied to peer %s", command, peer)
-			}
+		// for idx, peer := range peers {
+		idx := rand.Intn(len(peers))
+		peer := peers[idx]
+		log.DPrintf("Applying command [%s] to peer %s", command, peer)
+		if err := loadDriver.ApplyCommand(idx, command); err != nil {
+			log.DPrintf("Failed to apply command to %s: %v", peer, err)
+		} else {
+			log.DPrintf("Command [%s] applied to peer %s", command, peer)
 		}
+		// }
 	}
 
 	// Fetch logs
