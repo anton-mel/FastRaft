@@ -21,12 +21,13 @@ func (t *GRPCTransport) Addr() string {
 
 func (t *GRPCTransport) Dial(s *RaftServer, addr string) error {
 	// Establish the gRPC connection with insecure credentials
+	log.DPrintf("[%s] connecting to [%s]", t.Addr(), addr)
 	conn, err := grpc.NewClient(
 		addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
-
 	if err != nil {
+		log.DPrintf("could not connect to raft replica: %v", err)
 		return fmt.Errorf("could not connect to raft replica: %v", err)
 	}
 
@@ -35,12 +36,13 @@ func (t *GRPCTransport) Dial(s *RaftServer, addr string) error {
 		context.Background(),
 		&pb.AddrInfo{Addr: t.Addr()},
 	)
-
 	if err != nil {
+		log.DPrintf("[%s] error while calling bootstapping service: %v", t.Addr(), err)
 		return fmt.Errorf("[%s] error while calling bootstapping service: %v", t.Addr(), err)
 	}
 
 	if !response.IsAdded {
+		log.DPrintf("[%s] replica [%s] rejected the connection", t.Addr(), addr)
 		return fmt.Errorf("error while adding replica [%s] to [%s]: %v", t.Addr(), addr, err)
 	}
 

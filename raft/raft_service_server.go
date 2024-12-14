@@ -22,6 +22,9 @@ func NewRaftServiceServer(rf *RaftServer) *RaftServiceServer {
 
 func (s *RaftServiceServer) AddReplica(ctx context.Context, addrInfo *pb.AddrInfo) (*pb.AddrInfoStatus, error) {
 	log.DPrintf("[%s] received (addReplica) request from [%s]", s.rf.Transport.Addr(), addrInfo.Addr)
+	if addrInfo.Addr == "0.0.0.0:5000" {
+		return &pb.AddrInfoStatus{IsAdded: false}, nil
+	}
 
 	if ok := s.rf.ReplicaConnMap[addrInfo.Addr]; ok != nil {
 		// raft server already present
@@ -35,7 +38,6 @@ func (s *RaftServiceServer) AddReplica(ctx context.Context, addrInfo *pb.AddrInf
 		addrInfo.Addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
-
 	if err != nil {
 		log.DPrintf("[%s] error while creating gRPC client to [%s]", s.rf.Transport.Addr(), addrInfo.Addr)
 		return &pb.AddrInfoStatus{IsAdded: false}, err
