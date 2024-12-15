@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -506,7 +507,7 @@ func (rf *RaftServer) ticker() {
 			rf.mu.Unlock()
 
 			select {
-			case <-time.After(time.Duration(rand.Intn(5000)+1100) * time.Millisecond):
+			case <-time.After(time.Duration(rand.Intn(5000)+3000) * time.Millisecond):
 				rf.mu.Lock()
 				rf.state = CANDIDATE
 				// rf.persist()
@@ -534,7 +535,7 @@ func (rf *RaftServer) ticker() {
 
 			select {
 			case <-rf.cWinElection:
-			case <-time.After(time.Duration(rand.Intn(5000)+600) * time.Millisecond):
+			case <-time.After(time.Duration(rand.Intn(5000)+2200) * time.Millisecond):
 				rf.mu.Lock()
 				rf.state = FOLLOWER
 				rf.mu.Unlock()
@@ -558,6 +559,20 @@ func (rf *RaftServer) ticker() {
 			// limited to 10 heartbeats per second
 			time.Sleep(100 * time.Millisecond)
 		}
+	}
+}
+
+func (rf *RaftServer) waitForIncomingConnections() {
+	log.DPrintf("[%s] No initial peers. Waiting for incoming connections...", rf.Transport.Addr())
+	for {
+		rf.mu.Lock()
+		if rf.connectionsCount > 0 {
+			log.DPrintf("[%s] Received at least one connection. Proceeding...", rf.Transport.Addr())
+			rf.mu.Unlock()
+			break
+		}
+		rf.mu.Unlock()
+		time.Sleep(100 * time.Millisecond) // Avoid busy waiting
 	}
 }
 
@@ -605,22 +620,12 @@ func (rf *RaftServer) startElection() {
 func (rf *RaftServer) bootstrapNetwork() {
 	// If there are no peers initially, wait for connections
 	if len(rf.peers) == 0 {
-		log.DPrintf("[%s] No initial peers. Waiting for incoming connections...", rf.Transport.Addr())
-		for {
-			rf.mu.Lock()
-			if rf.connectionsCount > 0 {
-				log.DPrintf("[%s] Received at least one connection. Proceeding...", rf.Transport.Addr())
-				rf.mu.Unlock()
-				break
-			}
-			rf.mu.Unlock()
-			time.Sleep(100 * time.Millisecond) // Avoid busy waiting
-		}
+		rf.waitForIncomingConnections()
 	} else {
 		// Try connecting to the specified peers
 		wg := &sync.WaitGroup{}
 		for _, addr := range rf.peers {
-			if len(addr) == 0 {
+			if len(addr) == 0 || addr == rf.Transport.Addr() {
 				continue
 			}
 			wg.Add(1)
@@ -637,6 +642,9 @@ func (rf *RaftServer) bootstrapNetwork() {
 			}(addr)
 		}
 		wg.Wait()
+		if rf.connectionsCount == 0 {
+			rf.waitForIncomingConnections()
+		}
 	}
 
 	// Signal that bootstrapping is complete
@@ -644,12 +652,59 @@ func (rf *RaftServer) bootstrapNetwork() {
 	close(rf.cBootstrapComplete)
 }
 
+func resolveToIP(service string) (string, error) {
+	parts := strings.Split(service, ":")
+	if len(parts) != 2 {
+		return "", fmt.Errorf("invalid service format, expected hostname:port")
+	}
+	hostname := parts[0]
+	port := parts[1]
+	ips, err := net.LookupHost(hostname)
+	if err != nil {
+		if len(ips) == 0 {
+			return "", fmt.Errorf("failed to resolve hostname %s: %v", hostname, err)
+		} else {
+			return ips[0], fmt.Errorf("failed to resolve hostname %s: %v", hostname, err)
+		}
+	}
+	return fmt.Sprintf("%s:%s", ips[0], port), nil
+}
+
+// A quick solution to parse flags on deployement
+func parseFlags(me string, peers []string) (string, []string) {
+	// TODO: make it work locally
+	peerIPs := make([]string, 0)
+	peerList := strings.Split(peers[0][6:], ",")
+	me = me[3:]
+	log.DPrintf("My IP: %s", me)
+	for _, peer := range peerList {
+		// peerIPs = append(peerIPs, peer)
+		log.DPrintf("Peer: %s", peer)
+		ip, err := resolveToIP(peer)
+		log.DPrintf("IP: %s", ip)
+		if err != nil {
+			log.DPrintf("Failed to resolve peer %s: %v", peer, err)
+			continue
+		}
+		if ip == me {
+			continue
+		}
+		peerIPs = append(peerIPs, ip)
+	}
+	return me, peerIPs
+}
+
 func MakeRaftServer(me string, peers []string) *RaftServer {
+	time.Sleep(time.Second * 4)
+
 	rf := &RaftServer{}
+	// [Deployement Testing]
+	// comment for local testing
+	me, peerIPs := parseFlags(me, peers)
 
 	rf.mu.Lock()
 	rf.state = FOLLOWER
-	rf.peers = peers
+	rf.peers = peerIPs
 	// rf.persister = persister
 
 	rf.currentTerm = 0
@@ -709,7 +764,12 @@ func (rf *RaftServer) StartRaftServer() error {
 
 // SetUp the gRPC servers
 func (rf *RaftServer) startGrpcServer() error {
-	lis, err := net.Listen("tcp", rf.Transport.Addr())
+	// [Deployement Testing] uncomment for local testing
+	// lis, err := net.Listen("tcp", rf.Transport.Addr())
+	lis, err := net.Listen("tcp", ":5000")
+	// NOTE: this will fails in a local environement
+	// TODO: provide dec/proc testing flags
+
 	if err != nil {
 		return fmt.Errorf("failed to listen on port %s: %v", rf.Transport.Addr(), err)
 	}
