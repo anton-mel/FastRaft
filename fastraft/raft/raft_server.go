@@ -357,7 +357,7 @@ func (rf *RaftServer) sendRequestVote(server string, args *pb.RequestVoteRequest
 
 func (rf *RaftServer) sendAppendEntries(server string, grpcArgs *pb.AppendEntriesRequest, reply *pb.AppendEntriesResponse) {
 	log.DPrintf("[%v] (sendAppendEntries) Sending append entries to %v", rf.Transport.Addr(), server)
-	// NOTE! I have removed a deep-copying the AppendEntriesArgs
+	// NOTE! I (Anton) have removed a deep-copying the AppendEntriesArgs
 
 	// Acquire the connection to the replica
 	rf.ReplicaConnMapLock.RLock()
@@ -535,7 +535,7 @@ func (rf *RaftServer) ticker() {
 
 			select {
 			case <-rf.cWinElection:
-			case <-time.After(time.Duration(rand.Intn(5000)+2200) * time.Millisecond):
+			case <-time.After(time.Duration(rand.Intn(3000)+3000) * time.Millisecond):
 				rf.mu.Lock()
 				rf.state = FOLLOWER
 				rf.mu.Unlock()
@@ -619,6 +619,7 @@ func (rf *RaftServer) startElection() {
 // server to their replicaConnMap (establish gRPC connection)
 func (rf *RaftServer) bootstrapNetwork() {
 	// If there are no peers initially, wait for connections
+	time.Sleep(7 * time.Second)
 	if len(rf.peers) == 0 {
 		rf.waitForIncomingConnections()
 	} else {
@@ -766,10 +767,9 @@ func (rf *RaftServer) StartRaftServer() error {
 func (rf *RaftServer) startGrpcServer() error {
 	// [Deployement Testing] uncomment for local testing
 	// lis, err := net.Listen("tcp", rf.Transport.Addr())
-	lis, err := net.Listen("tcp", ":5000")
+	lis, err := net.Listen("tcp", ":5001")
 	// NOTE: this will fails in a local environement
 	// TODO: provide dec/proc testing flags
-
 	if err != nil {
 		return fmt.Errorf("failed to listen on port %s: %v", rf.Transport.Addr(), err)
 	}
@@ -885,6 +885,10 @@ func (rf *RaftServer) handleProposedEntryFollower(proposal *ProposedEntry) {
 	// If no entry at index i, insert the entry
 	if len(rf.log) <= index || rf.log[index].Index != e.Index {
 		log.DPrintf("[%v] (handleProposedEntry) Inserting entry %d at index %d", rf.Transport.Addr(), e.Index, index)
+		if len(rf.log) <= index {
+			newSize := index + 1 - len(rf.log)
+			rf.log = append(rf.log, make([]*pb.LogElement, newSize)...)
+		}
 		// Insert the entry at the correct position
 		rf.log[index] = e
 	}

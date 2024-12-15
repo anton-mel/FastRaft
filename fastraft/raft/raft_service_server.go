@@ -22,7 +22,7 @@ func NewRaftServiceServer(rf *RaftServer) *RaftServiceServer {
 
 func (s *RaftServiceServer) AddReplica(ctx context.Context, addrInfo *pb.AddrInfo) (*pb.AddrInfoStatus, error) {
 	log.DPrintf("[%s] received (addReplica) request from [%s]", s.rf.Transport.Addr(), addrInfo.Addr)
-	if addrInfo.Addr == "0.0.0.0:5000" {
+	if addrInfo.Addr == "0.0.0.0:5001" {
 		// [Deployement Testing] comment for local testing
 		return &pb.AddrInfoStatus{IsAdded: false}, nil
 	}

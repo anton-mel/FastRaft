@@ -27,7 +27,13 @@ module "eks" {
     raft_nodes = {
       desired_size = 3
       max_size         = 5
-      min_size         = 0
+      min_size         = 3
+      instance_types = ["t2.micro"]
+    }
+    fast_raft_nodes = {
+      desired_size = 3
+      max_size         = 5
+      min_size         = 3
       instance_types = ["t2.micro"]
     }
     raftload_nodes = {
@@ -55,6 +61,10 @@ data "aws_eks_cluster_auth" "raft_cluster" {
 # ECR Repository
 data "aws_ecr_repository" "raft_repo" {
   name = "raft"
+}
+
+data "aws_ecr_repository" "fastraft_repo" {
+  name = "fastraft"
 }
 
 provider "kubernetes" {
@@ -127,6 +137,16 @@ resource "kubernetes_config_map" "raft_config" {
   }
 }
 
+resource "kubernetes_config_map" "fastraft_config" {
+  metadata {
+    name      = "fastraft-config"
+  }
+
+  data = {
+    PEERS_IP = "fastraft-0.fastraft-service.default.svc.cluster.local:5001,fastraft-1.fastraft-service.default.svc.cluster.local:5001,fastraft-2.fastraft-service.default.svc.cluster.local:5001"
+  }
+}
+
 resource "kubernetes_service" "raft_service" {
   metadata {
     name = "raft-service"
@@ -141,6 +161,26 @@ resource "kubernetes_service" "raft_service" {
     port {
       port        = 5000
       target_port = 5000
+    }
+
+    # type = "Headless"
+  }
+}
+
+resource "kubernetes_service" "fastraft_service" {
+  metadata {
+    name = "fastraft-service"
+  }
+
+  spec {
+    cluster_ip = "None"
+    selector = {
+      app = "fastraft-node"
+    }
+
+    port {
+      port        = 5001
+      target_port = 5001
     }
 
     # type = "Headless"
@@ -203,6 +243,17 @@ resource "kubernetes_deployment" "raftload" {
               }
             }
           }
+
+          # env {
+          #   name = "FAST_PEERS_IP"
+          #   value_from {
+          #     config_map_key_ref {
+          #       name = kubernetes_config_map.fastraft_config.metadata[0].name
+          #       key  = "FAST_PEERS_IP"
+          #     }
+          #   }
+          # }
+
 
         }
       }
@@ -275,6 +326,83 @@ resource "kubernetes_stateful_set" "raft" {
             value_from {
               config_map_key_ref {
                 name = kubernetes_config_map.raft_config.metadata[0].name
+                key  = "PEERS_IP"
+              }
+            }
+          }
+
+          
+        }
+      }
+    }
+  }
+}
+
+
+resource "kubernetes_stateful_set" "fastraft" {
+  metadata {
+    name      = "fastraft"
+  }
+
+  spec {
+    service_name = "fastraft-service"
+    replicas     = 3
+
+    selector {
+      match_labels = {
+        app = "fastraft-node"
+      }
+    }
+
+    template {
+      metadata {
+        labels = {
+          app = "fastraft-node"
+        }
+      }
+
+      spec {
+        affinity {
+          pod_anti_affinity {
+            required_during_scheduling_ignored_during_execution {
+              label_selector {
+                match_expressions {
+                  key      = "app"
+                  operator = "In"
+                  values   = ["fastraft-node"]
+                }
+              }
+              topology_key = "kubernetes.io/hostname"
+            }
+          }
+        }
+
+        container {
+          name  = "raft-node"
+          image = "${data.aws_ecr_repository.fastraft_repo.repository_url}:latest"
+          image_pull_policy = "Always"
+          security_context {
+            privileged = true
+          }
+
+          port {
+            container_port = 5001
+          }
+
+          env {
+            name = "SELF_IP"
+            value_from {
+              field_ref {
+                field_path = "status.podIP"
+              }
+            }
+          }
+
+          env {
+            name = "PEERS_IP"
+            value_from {
+              config_map_key_ref {
+                name = kubernetes_config_map.fastraft_config.metadata[0].name
                 key  = "PEERS_IP"
               }
             }
