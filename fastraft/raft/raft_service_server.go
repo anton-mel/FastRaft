@@ -23,6 +23,7 @@ func NewRaftServiceServer(rf *RaftServer) *RaftServiceServer {
 func (s *RaftServiceServer) AddReplica(ctx context.Context, addrInfo *pb.AddrInfo) (*pb.AddrInfoStatus, error) {
 	log.DPrintf("[%s] received (addReplica) request from [%s]", s.rf.Transport.Addr(), addrInfo.Addr)
 	if addrInfo.Addr == "0.0.0.0:5000" {
+		// [Deployement Testing] comment for local testing
 		return &pb.AddrInfoStatus{IsAdded: false}, nil
 	}
 
@@ -105,10 +106,15 @@ func (s *RaftServiceServer) AppendEntries(ctx context.Context, args *pb.AppendEn
 			}
 		}
 	} else if args.PrevLogIdx > baseIdx-2 {
+		// [Fast Raft] If an existing entry conflicts
+		// with a new one, overwrite the existing entry
 		s.rf.log = s.rf.log[:args.PrevLogIdx-baseIdx+1]
 		s.rf.log = append(s.rf.log, args.Entries...)
+
 		reply.NextTryIdx = int32(len(args.Entries)) + args.PrevLogIdx
 		reply.Success = true
+
+		// Update commit index if needed
 		if int(args.LeaderCommit) > s.rf.commitIdx {
 			s.rf.commitIdx = int(min(args.LeaderCommit, s.rf.log[len(s.rf.log)-1].Index))
 			log.DPrintf("[%v] (AppendEntries) Committing logs up to %d", s.rf.Transport.Addr(), s.rf.commitIdx)
@@ -116,7 +122,7 @@ func (s *RaftServiceServer) AppendEntries(ctx context.Context, args *pb.AppendEn
 				s.rf.mu.Lock()
 				defer s.rf.mu.Unlock()
 				for i := s.rf.appliedLast + 1; i <= s.rf.commitIdx; i++ {
-					s.rf.performCommit(s.rf.log[i-int(s.rf.log[0].Index)].Command)
+					s.rf.insertEntry(s.rf.log[i-int(s.rf.log[0].Index)].Command, "leader")
 					// msg := ApplyMsg{CommandValid: true, Command: s.rf.log[i-s.rf.log[0].Index].Command, CommandIndex: i}
 					// s.rf.cApplyMsg <- msg
 				}
@@ -134,38 +140,55 @@ func (s *RaftServiceServer) RequestVote(ctx context.Context, args *pb.RequestVot
 	s.rf.mu.Lock()
 	defer s.rf.mu.Unlock()
 
-	reply := &pb.RequestVoteResponse{Term: int32(s.rf.currentTerm), VoteGranted: false}
+	reply := &pb.RequestVoteResponse{
+		Term:                int32(s.rf.currentTerm),
+		VoteGranted:         false,
+		SelfApprovedEntries: []*pb.LogElement{},
+	}
 
 	if int32(s.rf.currentTerm) > args.Term {
 		log.DPrintf("[%v] (RequestVote) Rejecting vote request from [%v] because my term is greater", s.rf.Transport.Addr(), args.CandidatePort)
 		return reply, nil
 	}
 
-	if int32(s.rf.currentTerm) < args.Term {
-		log.DPrintf("[%v] (RequestVote) Updating term to %d", s.rf.Transport.Addr(), args.Term)
-		s.rf.currentTerm = int(args.Term)
-		s.rf.votedFor = "" // invalidate previous vote in new term
-		s.rf.state = FOLLOWER
+	// if int32(s.rf.currentTerm) < args.Term {
+	// 	log.DPrintf("[%v] (RequestVote) Updating term to %d", s.rf.Transport.Addr(), args.Term)
+	// 	s.rf.currentTerm = int(args.Term)
+	// 	s.rf.votedFor = "" // invalidate previous vote in new term
+	// 	s.rf.state = FOLLOWER
+	// }
+
+	// [Fast Raft] Collect all self-approved entries from the log
+	selfApprovedEntries := []*pb.LogElement{}
+	for _, entry := range s.rf.log {
+		if entry.InsertedBy == "self" {
+			selfApprovedEntries = append(selfApprovedEntries, entry)
+		}
 	}
 
 	lastTxn := s.rf.log[len(s.rf.log)-1]
-	if args.LastLogTerm > lastTxn.Term {
-		log.DPrintf("[%v] (RequestVote) Granting vote to [%v] (candidate's log term is higher)", s.rf.Transport.Addr(), args.CandidatePort)
-		reply.VoteGranted = true
-		s.rf.votedFor = args.CandidatePort
-		s.rf.cHeartbeat <- struct{}{}
-	} else if args.LastLogTerm == lastTxn.Term && args.LastLogIdx >= lastTxn.Index {
-		if s.rf.votedFor == "" || s.rf.votedFor == args.CandidatePort {
+
+	// if args.LastLogTerm > lastTxn.Term {
+	// 	log.DPrintf("[%v] (RequestVote) Granting vote to [%v] (candidate's log term is higher)", s.rf.Transport.Addr(), args.CandidatePort)
+	// 	reply.VoteGranted = true
+	// 	s.rf.votedFor = args.CandidatePort
+	// 	s.rf.cHeartbeat <- struct{}{}
+	// } else if args.LastLogTerm == lastTxn.Term && args.LastLogIdx >= lastTxn.Index {
+
+	if s.rf.votedFor == "" || s.rf.votedFor == args.CandidatePort {
+		// [Fast Raft] Look (When receiving a RequestVote message from a candidate) Table
+		if (int(lastTxn.Index) >= s.rf.lastLeaderIdx && lastTxn.Term >= s.rf.log[s.rf.lastLeaderIdx].Term) || lastTxn.Term > s.rf.log[s.rf.lastLeaderIdx].Term {
 			log.DPrintf("[%v] (RequestVote) Granting vote to [%v] (candidate's log is equally up-to-date)", s.rf.Transport.Addr(), args.CandidatePort)
 			reply.VoteGranted = true
 			s.rf.votedFor = args.CandidatePort
 			s.rf.cHeartbeat <- struct{}{}
+			reply.SelfApprovedEntries = selfApprovedEntries
 		} else {
-			log.DPrintf("[%v] (RequestVote) Rejecting vote request from [%v] since already voted for [%v]", s.rf.Transport.Addr(), args.CandidatePort, s.rf.votedFor)
+			log.DPrintf("[%v] (RequestVote) Rejecting vote request from [%v] (candidate's log is not up-to-date)", s.rf.Transport.Addr(), args.CandidatePort)
 			reply.VoteGranted = false
 		}
 	} else {
-		log.DPrintf("[%v] (RequestVote) Rejecting vote request from [%v] (candidate's log is less up-to-date)", s.rf.Transport.Addr(), args.CandidatePort)
+		log.DPrintf("[%v] (RequestVote) Rejecting vote request from [%v] since already voted for [%v]", s.rf.Transport.Addr(), args.CandidatePort, s.rf.votedFor)
 		reply.VoteGranted = false
 	}
 
@@ -185,9 +208,10 @@ func (s *RaftServiceServer) CommitOperation(context context.Context, txn *pb.Com
 	}
 
 	newLogEntry := &pb.LogElement{
-		Index:   int32(txn.Index),
-		Command: txn.Operation,
-		Term:    int32(txn.Term),
+		Index:      int32(txn.Index),
+		Command:    txn.Operation,
+		Term:       int32(txn.Term),
+		InsertedBy: "leader",
 	}
 	s.rf.log = append(s.rf.log, newLogEntry)
 
@@ -202,14 +226,14 @@ func (s *RaftServiceServer) ApplyOperation(ctx context.Context, txn *pb.ApplyOpe
 
 	if s.rf.commitIdx < len(s.rf.log)-1 {
 		s.rf.commitIdx++
-		appliedEntry := s.rf.log[s.rf.commitIdx]
-		s.rf.applyCh <- appliedEntry
+		// appliedEntry := s.rf.log[s.rf.commitIdx]
+		// s.rf.applyCh <- appliedEntry
 	}
 
 	return &pb.ApplyOperationResponse{}, nil
 }
 
 func (s *RaftServiceServer) ForwardOperation(ctx context.Context, in *pb.ForwardOperationRequest) (*pb.ForwardOperationResponse, error) {
-	s.rf.performCommit(in.Operation)
+	s.rf.insertEntry(in.Operation, "self")
 	return &pb.ForwardOperationResponse{}, nil
 }
