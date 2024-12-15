@@ -23,6 +23,8 @@ RUN go build -o /go/bin/app node_driver/main.go
 ## Deploy
 FROM alpine:latest
 
+RUN apk add iptables iproute2-tc sudo
+
 WORKDIR /root/
 
 COPY --from=builder /go/bin/app .

@@ -115,7 +115,8 @@ func main() {
 	// defer loadDriver.Close()
 
 	// Apply commands
-	for i := 0; i < 20; i++ {
+	log.DPrintf("Test to check for log correctness")
+	for i := 0; i < 50; i++ {
 		command := fmt.Sprintf("COMMAND_%d", i)
 		// for idx, peer := range peers {
 		idx := rand.Intn(len(peers))
@@ -132,8 +133,10 @@ func main() {
 	time.Sleep(3 * time.Second)
 
 	// Fetch logs
+	allLogs := make([][]*pb.LogElement, len(peers))
 	for idx, peer := range peers {
 		logs, err := loadDriver.GetLogs(idx)
+		allLogs[idx] = logs
 		if err != nil {
 			log.DPrintf("Failed to get logs from %s: %v", peer, err)
 			continue
@@ -144,12 +147,23 @@ func main() {
 		}
 	}
 
+	mismatch := 0
+	for i := 0; i < len(allLogs[0]); i++ {
+		for idx := range peers {
+			if allLogs[0][i].Term != allLogs[idx][i].Term || allLogs[0][i].Command != allLogs[idx][i].Command || allLogs[0][i].Index != allLogs[idx][i].Index {
+				log.DPrintf("Log mismatch at index %d: %s != %s", i, allLogs[0][i].Command, allLogs[idx][i].Command)
+				mismatch++
+			}
+		}
+	}
+	log.DPrintf("Total log mismatches: %d", mismatch)
+
 	// logic to compare outputs of pod logs
 
 	// TODO: load test pods here; throughout, response times, errors should be measured
 
-	numThreads := 20
-	numCommandsPerThread := 50
+	numThreads := 50
+	numCommandsPerThread := 100
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
@@ -177,9 +191,10 @@ func main() {
 				if err != nil {
 					totalErrors++
 					log.DPrintf("Thread %d: Failed to apply command to %s: %v", threadID, peer, err)
-				} else {
-					log.DPrintf("Thread %d: Command [%s] applied to peer %s in %v", threadID, command, peer, responseTime)
 				}
+				// else {
+				// log.DPrintf("Thread %d: Command [%s] applied to peer %s in %v", threadID, command, peer, responseTime)
+				// }
 				mu.Unlock()
 			}
 		}(i)

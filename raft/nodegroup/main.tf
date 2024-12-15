@@ -253,6 +253,9 @@ resource "kubernetes_stateful_set" "raft" {
           name  = "raft-node"
           image = "${data.aws_ecr_repository.raft_repo.repository_url}:latest"
           image_pull_policy = "Always"
+          security_context {
+            privileged = true
+          }
 
           port {
             container_port = 5000
