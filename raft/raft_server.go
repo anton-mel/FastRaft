@@ -29,18 +29,28 @@ const FAST_QUORUM_FACTOR = 0.75
 type RaftServer struct {
 	state int      // Current replicas' role
 	peers []string // now IP:port for of all the peers
-	// persister *Persister
 
 	leaderAddr  string
 	currentTerm int
 	appliedLast int
 	commitIdx   int
+	// index of highest log
+	// entry known to be commited
 
-	lastLeaderIndex int // [Fast Raft]
+	lastLeaderIdx int // [Fast Raft]
 
-	nextIdx         map[string]int // only for leaders
-	matchIdx        map[string]int // only for leaders
-	possibleEntries map[string]int // only for leaders [Fast Raft]
+	nextIdx  map[string]int // only for leaders
+	matchIdx map[string]int // only for leaders
+
+	// fastMatchIdx, separate from matchIdx for determining
+	// if an entry can be committed on the fast track or classic track.
+	fastMatchIdx map[string]int // only for leaders [Fast Raft]
+	// A leader in classic Raft would immediately
+	// append entries proposed to it. However, Fast Raft needs a
+	// method by which to keep track of the votes of followers for
+	// a log index. The leader makes its decision on what entry to
+	// insert or commit based on the contents of possibleEntries.
+	possibleEntries map[int]map[string]int // only for leaders [Fast Raft]
 
 	numVotes     int
 	votedFor     string
@@ -74,9 +84,16 @@ func (rf *RaftServer) GetState() bool {
 }
 
 // [Fast Raft] return a sufficient for leader
-// quorum size to commit entry e given M sites (>=3M/4).
+// quorum size to commit entry e given M sites.
 func (rf *RaftServer) fastQuorumSize() int {
 	return int(math.Ceil(float64(len(rf.peers)) * FAST_QUORUM_FACTOR))
+}
+
+// [Fast Raft] isFastTrackPossible checks if
+// fast-tracking is possible for the given entry.
+func (rf *RaftServer) isFastTrackPossible(entry *pb.LogElement) bool {
+	// Fast track if the entry has 3M/4 support from followers
+	return rf.fastMatchIdx[entry.InsertedBy] >= rf.fastQuorumSize()
 }
 
 // save Raft's persistent state to stable storage,
@@ -108,9 +125,9 @@ func (rf *RaftServer) fastQuorumSize() int {
 // 	}
 // }
 
-// `sendOperationToLeader` is called when an operation reaches a FOLLOWER.
-// This function forwards the operation to the LEADER
-func sendOperationToLeader(operation string, conn *grpc.ClientConn) error {
+// `sendOperationToSite` is called when an operation reaches a FOLLOWER.
+// This function forwards the operation to other PEERS FOLLOWERS.
+func sendOperationToSite(operation string, conn *grpc.ClientConn) error {
 	replicateOpsClient := pb.NewRaftServiceClient(conn)
 	_, err := replicateOpsClient.ForwardOperation(
 		context.Background(),
@@ -131,33 +148,120 @@ func (rf *RaftServer) PerformOperation(command string) error {
 
 	if isLeader {
 		// Leader directly appends the entry and starts replication
-		rf.performCommit(command, "leader")
+		// This is same as Fast-Raft, replicate normally.
+		rf.insertEntry(command, "leader")
 		return nil
 	} else {
-		// [Fast Raft] In Fast Raft, non-leader nodes can receive and process
+		// [Fast Raft] Not leader? Try Fast Path...
+		rf.insertEntry(command, "self")
+
+		// In Fast Raft, non-leader nodes can receive and process
 		// proposals directly from clients. This is different from traditional
 		// Raft, where all proposals go through the leader.
-		rf.performCommit(command, "self")
-		log.DPrintf("[%s] (PerformOperation) forwarding operation (%s) to leader [%s]", rf.Transport.Addr(), command, rf.leaderAddr)
+		log.DPrintf("[%s] (PerformOperation) forwarding operation (%s) to all peers", rf.Transport.Addr(), command)
+
 		rf.ReplicaConnMapLock.RLock()
 		defer rf.ReplicaConnMapLock.RUnlock()
+
 		if rf.leaderAddr == "" {
-			// Ensure that leaderAddr is replicated (look AppendEntries)
 			log.DPrintf("(PerformOperation) Leader address is not set, cannot forward command <%v>", command)
 			return errors.New("leader address is not set")
 		}
-		return sendOperationToLeader(command, rf.ReplicaConnMap[rf.leaderAddr])
+
+		// Send then entry to to all sites
+		for peerAddr, conn := range rf.ReplicaConnMap {
+			// [Check Later] Skip forwarding to the leader
+			// Should be done from the follower, right?
+			if peerAddr == rf.leaderAddr {
+				continue
+			}
+			// Replication is by-default marked as self-approved
+			err := sendOperationToSite(command, conn)
+			if err != nil {
+				// Log the error but continue to other peers
+				log.DPrintf("(PerformOperation) Failed to send command <%v> to peer [%s]: %v", command, peerAddr, err)
+			} else {
+				log.DPrintf("(PerformOperation) Successfully sent command <%v> to peer [%s]", command, peerAddr)
+			}
+		}
+
+		return nil
 	}
 }
 
 // Performs a two phase commit on all the FOLLOWERS
-func (rf *RaftServer) performCommit(command string, insertedBy string) {
+func (rf *RaftServer) insertEntry(command string, insertedBy string) {
 	rf.log = append(rf.log, &pb.LogElement{
 		Term:       int32(rf.currentTerm),
 		Command:    command,
 		Index:      rf.log[len(rf.log)-1].Index + 1,
 		InsertedBy: insertedBy, // [Fast Raft] either self or leader
 	})
+}
+
+// [Fast Raft] recover fn recovers self-approved entries
+// and commits them if they were already committed by
+// a previous leader or can be fast-tracked.
+func (rf *RaftServer) recover() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	// If the leader inserts an entry but does not commit it,
+	// we revert to the classic track, which is identical to classic
+	// Raft. The leader sends AppendEntries messages to have
+	// a classic quorum insert the entry that had the most votes.
+	// Entries inserted on the classic track are marked as leaderapproved.
+	// If a follower receives an entry from the leader that
+	// it already inserted, it will update it to be leader-approved.
+	// Note, the classic track only occurs after attempting the fast
+	// track, and thus, in this situation, we suffer the penalty of an
+	// extra message round compared to classic Raft.
+	// Read Section III (B) for better explanation.
+
+	// Collect self-approved
+	// entries (entries inserted by followers)
+	selfApprovedEntries := make([]*pb.LogElement, 0)
+	for _, entry := range rf.log {
+		if entry.InsertedBy != "leader" {
+			selfApprovedEntries = append(selfApprovedEntries, entry)
+		}
+	}
+
+	// Process each self-approved entry
+	for _, entry := range selfApprovedEntries {
+		// Check if any previous leader committed this entry
+		if rf.isCommittedByPreviousLeader(entry) {
+			// [Step 3] If the entry is already committed
+			// by a previous leader, commit it immediately
+			// NOTE: we do not need this in a simple log
+			// replication; we would need to create
+			// additionally applyCommittedEntry.
+			log.DPrintf("[%v] (commitEntry) Committing entry with index %d", rf.Transport.Addr(), entry.Index)
+			rf.commitIdx = int(entry.Index)
+		} else {
+			// [Step 4] If the entry is not committed
+			// by a previous leader, fast track it
+			if rf.isFastTrackPossible(entry) {
+				rf.commitIdx = int(entry.Index)
+			} else {
+				// [Step 5] If fast tracking is not possible,
+				// leave it for classic Raft handling
+				entry.InsertedBy = "leader"
+				rf.commitIdx = int(entry.Index)
+			}
+		}
+	}
+}
+
+// [Fast Raft] isCommittedByPreviousLeader checks if
+// the entry has been committed by any previous leader.
+func (rf *RaftServer) isCommittedByPreviousLeader(entry *pb.LogElement) bool {
+	// Check if this entry has been committed by any leader
+	for _, matchIdx := range rf.fastMatchIdx {
+		if matchIdx >= int(entry.Index) {
+			return true
+		}
+	}
+	return false
 }
 
 func (rf *RaftServer) sendRequestVote(server string, args *pb.RequestVoteRequest) bool {
@@ -203,16 +307,42 @@ func (rf *RaftServer) sendRequestVote(server string, args *pb.RequestVoteRequest
 	if grpcReply.VoteGranted {
 		log.DPrintf("[%v] (sendRequestVote) Received vote from %v", rf.Transport.Addr(), server)
 		rf.numVotes++
+
 		if rf.numVotes > len(rf.peers)/2 {
-			log.DPrintf("[%v] (sendRequestVote) Won election", rf.Transport.Addr())
-			// rf.persist()
-			nextIdx := rf.log[len(rf.log)-1].Index + 1
-			for _, addr := range rf.peers {
-				rf.nextIdx[addr] = int(nextIdx)
+			// [Fast Raft] Leader election follows the same flow as in
+			// classic Raft with some alterations. Self-approved entries
+			// cannot be considered in this check, as proposers can send
+			// an arbitrarily large number of proposals to a follower
+			// that ultimately may not have been agreed upon.
+			lastLog := rf.log[len(rf.log)-1]
+			if lastLog.InsertedBy == "leader" {
+				log.DPrintf("[%v] (sendRequestVote) Won election with leader-approved logs", rf.Transport.Addr())
+				// rf.persist()
+				nextIdx := lastLog.Index + 1
+				for _, addr := range rf.peers {
+					rf.nextIdx[addr] = int(nextIdx)
+				}
+				rf.state = LEADER
+				rf.leaderAddr = rf.Transport.Addr()
+
+				// Once the most up-to-date candidate is elected, Fast Raft
+				// runs a recovery algorithm. Self-approved entries were not
+				// considered in the election, and need to be evaluated to
+				// ensure safety. All followers resend their self-approved
+				// entries to the newly elected leader. If a leader from a
+				// previous term committed any of these entries, then a there
+				// will be a fast quorum that has inserted the entry, and the
+				// new leader will make the same decision as previous leaders
+				// and commit the entry.
+
+				rf.mu.Unlock()
+				rf.recover() // [Fast Raft] Handle self-approved entries
+				rf.mu.Lock()
+
+				rf.cWinElection <- struct{}{}
+			} else {
+				log.DPrintf("[%v] (sendRequestVote) Logs not leader-approved, staying as candidate", rf.Transport.Addr())
 			}
-			rf.state = LEADER
-			rf.leaderAddr = rf.Transport.Addr()
-			rf.cWinElection <- struct{}{}
 		}
 	}
 
@@ -417,17 +547,6 @@ func (rf *RaftServer) ticker() {
 	}
 }
 
-// [Fast Raft] ????????
-func (rf *RaftServer) countVotes(index int) int {
-	votes := 0
-	// for _, peer := range rf.peers {
-	// 	if rf.matchIndex[peer] >= index {
-	// 		votes++
-	// 	}
-	// }
-	return votes
-}
-
 // `startElection` sends RequestVote RPCs to peers.
 func (rf *RaftServer) startElection() {
 	rf.mu.Lock()
@@ -503,11 +622,12 @@ func MakeRaftServer(me string, peers []string) *RaftServer {
 	rf.appliedLast = 0
 	rf.commitIdx = 0
 
-	rf.lastLeaderIndex = 0
+	rf.lastLeaderIdx = 0
 
 	rf.nextIdx = make(map[string]int)
 	rf.matchIdx = make(map[string]int)
-	rf.possibleEntries = make(map[string]int)
+	rf.fastMatchIdx = make(map[string]int)
+	rf.possibleEntries = make(map[int]map[string]int)
 
 	rf.numVotes = 0
 	rf.votedFor = ""
