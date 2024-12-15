@@ -26,6 +26,12 @@ const (
 // quorum for the fast path.
 const FAST_QUORUM_FACTOR = 0.75
 
+type ProposedEntry struct {
+	Entry *pb.LogElement
+	Site  string // IP:port
+	Count int    // for commit
+}
+
 type RaftServer struct {
 	state int      // Current replicas' role
 	peers []string // now IP:port for of all the peers
@@ -50,12 +56,13 @@ type RaftServer struct {
 	// method by which to keep track of the votes of followers for
 	// a log index. The leader makes its decision on what entry to
 	// insert or commit based on the contents of possibleEntries.
-	possibleEntries map[int]map[string]int // only for leaders [Fast Raft]
+	possibleEntries map[int][]*ProposedEntry // only for leaders [Fast Raft]
 
-	numVotes     int
-	votedFor     string
-	cWinElection chan struct{}
-	cHeartbeat   chan struct{}
+	numVotes      int
+	votedFor      string
+	cWinElection  chan struct{}
+	cHeartbeat    chan struct{}
+	cProposeEntry chan ProposedEntry
 
 	connectionsCount   int
 	cBootstrapComplete chan struct{} // avoid split vote when manually launching the nodes
@@ -64,8 +71,8 @@ type RaftServer struct {
 	// for himself. And since majority cannot be found, this is a deadlock.
 
 	Transport Transport
-	applyCh   chan *pb.LogElement
-	log       []*pb.LogElement
+	// applyCh   chan *pb.LogElement // testing only logging
+	log []*pb.LogElement
 
 	// { address of server, connection client }, we will maintain
 	// the connections and reuse them to reduce latency using
@@ -89,40 +96,11 @@ func (rf *RaftServer) fastQuorumSize() int {
 	return int(math.Ceil(float64(len(rf.peers)) * FAST_QUORUM_FACTOR))
 }
 
-// [Fast Raft] isFastTrackPossible checks if
-// fast-tracking is possible for the given entry.
-func (rf *RaftServer) isFastTrackPossible(entry *pb.LogElement) bool {
-	// Fast track if the entry has 3M/4 support from followers
-	return rf.fastMatchIdx[entry.InsertedBy] >= rf.fastQuorumSize()
-}
-
-// save Raft's persistent state to stable storage,
-// where it can later be retrieved after a crash and restart.
-// see paper's Figure 2 for a description of what should be persistent.
-// NOTE: only call when holding lock
-// func (rf *RaftServer) persist() {
-// 	log.DPrintf("[%v] (persist) Persisting state", rf.Transport.Addr())
-// 	w := new(bytes.Buffer)
-// 	e := labgob.NewEncoder(w)
-// 	if e.Encode(rf.currentTerm) != nil || e.Encode(rf.votedFor) != nil || e.Encode(rf.logfile) != nil {
-// 		log.DPrintf("[%v] (persist) Error encoding state", rf.Transport.Addr())
-// 		return
-// 	}
-// 	rf.persister.SaveRaftState(w.Bytes())
-// }
-
-// restore previously persisted state.
-// NOTE: only call when holding lock
-// func (rf *RaftServer) readPersist(data []byte) {
-// 	log.DPrintf("[%v] (readPersist) Reading persisted state", rf.Transport.Addr())
-// 	if data == nil || len(data) < 1 { // bootstrap without any state?
-// 		return
-// 	}
-// 	r := bytes.NewBuffer(data)
-// 	d := labgob.NewDecoder(r)
-// 	if d.Decode(&rf.currentTerm) != nil || d.Decode(&rf.votedFor) != nil || d.Decode(&rf.logfile) != nil {
-// 		log.DPrintf("[%v] (readPersist) Error decoding state", rf.Transport.Addr())
-// 	}
+// // [Fast Raft] isFastTrackPossible checks if
+// // fast-tracking is possible for the given entry.
+// func (rf *RaftServer) isFastTrackPossible(entry *pb.LogElement) bool {
+// 	// Fast track if the entry has 3M/4 support from followers
+// 	return rf.fastMatchIdx[entry.InsertedBy] >= rf.fastQuorumSize()
 // }
 
 // `sendOperationToSite` is called when an operation reaches a FOLLOWER.
@@ -144,11 +122,11 @@ func (rf *RaftServer) PerformOperation(command string) error {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
 	log.DPrintf("[%v] (PerformOperation) Is Leader: [%v]", rf.Transport.Addr(), isLeader)
 
 	if isLeader {
 		// Leader directly appends the entry and starts replication
-		// This is same as Fast-Raft, replicate normally.
 		rf.insertEntry(command, "leader")
 		return nil
 	} else {
@@ -168,25 +146,39 @@ func (rf *RaftServer) PerformOperation(command string) error {
 			return errors.New("leader address is not set")
 		}
 
-		// Send then entry to to all sites
+		// Send the entry to all peers (including leader)
+		// in case the current node is a follower
 		for peerAddr, conn := range rf.ReplicaConnMap {
-			// [Check Later] Skip forwarding to the leader
-			// Should be done from the follower, right?
-			if peerAddr == rf.leaderAddr {
+			// [Check Later] Skip forwarding to self or leader
+			if peerAddr == rf.Transport.Addr() || peerAddr == rf.leaderAddr {
 				continue
 			}
 			// Replication is by-default marked as self-approved
 			err := sendOperationToSite(command, conn)
 			if err != nil {
-				// Log the error but continue to other peers
 				log.DPrintf("(PerformOperation) Failed to send command <%v> to peer [%s]: %v", command, peerAddr, err)
 			} else {
 				log.DPrintf("(PerformOperation) Successfully sent command <%v> to peer [%s]", command, peerAddr)
 			}
 		}
 
+		// Start a timeout check for proposal commit (VERY NOT SURE)
+		// Look (To propose an entry) table for more info.
+		go rf.handleProposalTimeout(command)
 		return nil
 	}
+}
+
+// [Fast Raft] If log entry not committed after
+// proposal timeout, resend log entry (VERY NOT SURE)
+func (rf *RaftServer) handleProposalTimeout(command string) {
+	timeout := time.NewTimer(3 * time.Second) // 2-3 heartbeats
+	// Wait for the timeout to expire
+	<-timeout.C
+	// retry the operation if not committed
+	log.DPrintf("[%v] (handleProposalTimeout) Timeout for proposal <%v>, retrying...", rf.Transport.Addr(), command)
+	// Resend the proposal or perform another necessary action
+	rf.PerformOperation(command)
 }
 
 // Performs a two phase commit on all the FOLLOWERS
@@ -199,70 +191,70 @@ func (rf *RaftServer) insertEntry(command string, insertedBy string) {
 	})
 }
 
-// [Fast Raft] recover fn recovers self-approved entries
-// and commits them if they were already committed by
-// a previous leader or can be fast-tracked.
-func (rf *RaftServer) recover() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	// If the leader inserts an entry but does not commit it,
-	// we revert to the classic track, which is identical to classic
-	// Raft. The leader sends AppendEntries messages to have
-	// a classic quorum insert the entry that had the most votes.
-	// Entries inserted on the classic track are marked as leaderapproved.
-	// If a follower receives an entry from the leader that
-	// it already inserted, it will update it to be leader-approved.
-	// Note, the classic track only occurs after attempting the fast
-	// track, and thus, in this situation, we suffer the penalty of an
-	// extra message round compared to classic Raft.
-	// Read Section III (B) for better explanation.
+// // [Fast Raft] recover fn recovers self-approved entries
+// // and commits them if they were already committed by
+// // a previous leader or can be fast-tracked.
+// func (rf *RaftServer) recover() {
+// 	rf.mu.Lock()
+// 	defer rf.mu.Unlock()
+// 	// If the leader inserts an entry but does not commit it,
+// 	// we revert to the classic track, which is identical to classic
+// 	// Raft. The leader sends AppendEntries messages to have
+// 	// a classic quorum insert the entry that had the most votes.
+// 	// Entries inserted on the classic track are marked as leaderapproved.
+// 	// If a follower receives an entry from the leader that
+// 	// it already inserted, it will update it to be leader-approved.
+// 	// Note, the classic track only occurs after attempting the fast
+// 	// track, and thus, in this situation, we suffer the penalty of an
+// 	// extra message round compared to classic Raft.
+// 	// Read Section III (B) for better explanation.
 
-	// Collect self-approved
-	// entries (entries inserted by followers)
-	selfApprovedEntries := make([]*pb.LogElement, 0)
-	for _, entry := range rf.log {
-		if entry.InsertedBy != "leader" {
-			selfApprovedEntries = append(selfApprovedEntries, entry)
-		}
-	}
+// 	// Collect self-approved
+// 	// entries (entries inserted by followers)
+// 	selfApprovedEntries := make([]*pb.LogElement, 0)
+// 	for _, entry := range rf.log {
+// 		if entry.InsertedBy != "leader" {
+// 			selfApprovedEntries = append(selfApprovedEntries, entry)
+// 		}
+// 	}
 
-	// Process each self-approved entry
-	for _, entry := range selfApprovedEntries {
-		// Check if any previous leader committed this entry
-		if rf.isCommittedByPreviousLeader(entry) {
-			// [Step 3] If the entry is already committed
-			// by a previous leader, commit it immediately
-			// NOTE: we do not need this in a simple log
-			// replication; we would need to create
-			// additionally applyCommittedEntry.
-			log.DPrintf("[%v] (commitEntry) Committing entry with index %d", rf.Transport.Addr(), entry.Index)
-			rf.commitIdx = int(entry.Index)
-		} else {
-			// [Step 4] If the entry is not committed
-			// by a previous leader, fast track it
-			if rf.isFastTrackPossible(entry) {
-				rf.commitIdx = int(entry.Index)
-			} else {
-				// [Step 5] If fast tracking is not possible,
-				// leave it for classic Raft handling
-				entry.InsertedBy = "leader"
-				rf.commitIdx = int(entry.Index)
-			}
-		}
-	}
-}
+// 	// Process each self-approved entry
+// 	for _, entry := range selfApprovedEntries {
+// 		// Check if any previous leader committed this entry
+// 		if rf.isCommittedByPreviousLeader(entry) {
+// 			// [Step 3] If the entry is already committed
+// 			// by a previous leader, commit it immediately
+// 			// NOTE: we do not need this in a simple log
+// 			// replication; we would need to create
+// 			// additionally applyCommittedEntry.
+// 			log.DPrintf("[%v] (commitEntry) Committing entry with index %d", rf.Transport.Addr(), entry.Index)
+// 			rf.commitIdx = int(entry.Index)
+// 		} else {
+// 			// [Step 4] If the entry is not committed
+// 			// by a previous leader, fast track it
+// 			if rf.isFastTrackPossible(entry) {
+// 				rf.commitIdx = int(entry.Index)
+// 			} else {
+// 				// [Step 5] If fast tracking is not possible,
+// 				// leave it for classic Raft handling
+// 				entry.InsertedBy = "leader"
+// 				rf.commitIdx = int(entry.Index)
+// 			}
+// 		}
+// 	}
+// }
 
-// [Fast Raft] isCommittedByPreviousLeader checks if
-// the entry has been committed by any previous leader.
-func (rf *RaftServer) isCommittedByPreviousLeader(entry *pb.LogElement) bool {
-	// Check if this entry has been committed by any leader
-	for _, matchIdx := range rf.fastMatchIdx {
-		if matchIdx >= int(entry.Index) {
-			return true
-		}
-	}
-	return false
-}
+// // [Fast Raft] isCommittedByPreviousLeader checks if
+// // the entry has been committed by any previous leader.
+// func (rf *RaftServer) isCommittedByPreviousLeader(entry *pb.LogElement) bool {
+// 	// Check if this entry has been committed by any leader
+// 	for _, matchIdx := range rf.fastMatchIdx {
+// 		if matchIdx >= int(entry.Index) {
+// 			return true
+// 		}
+// 	}
+// 	return false
+// }
 
 func (rf *RaftServer) sendRequestVote(server string, args *pb.RequestVoteRequest) bool {
 	// Acquire the connection to the replica
@@ -325,6 +317,19 @@ func (rf *RaftServer) sendRequestVote(server string, args *pb.RequestVoteRequest
 				rf.state = LEADER
 				rf.leaderAddr = rf.Transport.Addr()
 
+				// [Fast Raft] Handle self-approved entries
+				// Collect all self-approved entries
+				for _, entry := range rf.log {
+					if entry.InsertedBy == "leader" {
+						index := int(entry.Index)
+						rf.possibleEntries[index] = append(rf.possibleEntries[index], &ProposedEntry{
+							Entry: entry,
+							Site:  rf.Transport.Addr(), // Assuming the leader is the proposer
+							Count: 1,                   // Leader's self-approval counts as 1
+						})
+					}
+				}
+
 				// Once the most up-to-date candidate is elected, Fast Raft
 				// runs a recovery algorithm. Self-approved entries were not
 				// considered in the election, and need to be evaluated to
@@ -335,9 +340,9 @@ func (rf *RaftServer) sendRequestVote(server string, args *pb.RequestVoteRequest
 				// new leader will make the same decision as previous leaders
 				// and commit the entry.
 
-				rf.mu.Unlock()
-				rf.recover() // [Fast Raft] Handle self-approved entries
-				rf.mu.Lock()
+				// rf.mu.Unlock()
+				// rf.recover() // [Fast Raft] Handle self-approved entries
+				// rf.mu.Lock()
 
 				rf.cWinElection <- struct{}{}
 			} else {
@@ -479,8 +484,8 @@ func (rf *RaftServer) broadcastHeartbeat() {
 				}
 
 				// Append log entries if there are new entries
-				if nextIdx <= int(rf.log[len(rf.log)-1].Index) {
-					args.Entries = rf.log[nextIdx-int(baseIdx):]
+				if nextIdx <= rf.lastLeaderIdx {
+					args.Entries = rf.log[nextIdx-int(baseIdx) : rf.lastLeaderIdx]
 				}
 
 				// Send AppendEntries RPC in a separate goroutine
@@ -510,6 +515,10 @@ func (rf *RaftServer) ticker() {
 				rf.mu.Lock()
 				log.DPrintf("[%v] (ticker) Received heartbeat", rf.Transport.Addr())
 				rf.mu.Unlock()
+			case proposedEntry := <-rf.cProposeEntry:
+				rf.mu.Lock()
+				rf.handleProposedEntryFollower(&proposedEntry)
+				rf.mu.Unlock()
 			}
 
 		case CANDIDATE:
@@ -534,12 +543,17 @@ func (rf *RaftServer) ticker() {
 				rf.state = FOLLOWER
 				log.DPrintf("[%v] (ticker) Received heartbeat", rf.Transport.Addr())
 				rf.mu.Unlock()
+			case proposedEntry := <-rf.cProposeEntry:
+				rf.mu.Lock()
+				rf.handleProposedEntryLeader(&proposedEntry)
+				rf.mu.Unlock()
 			}
 
 		case LEADER:
 			log.DPrintf("[%v] (ticker) LEADER in term %d", rf.Transport.Addr(), rf.currentTerm)
 			rf.mu.Unlock()
 			go rf.broadcastHeartbeat()
+			go rf.periodicallyCommitEntries()
 			// rf.persist()
 			// limited to 10 heartbeats per second
 			time.Sleep(100 * time.Millisecond)
@@ -550,13 +564,33 @@ func (rf *RaftServer) ticker() {
 // `startElection` sends RequestVote RPCs to peers.
 func (rf *RaftServer) startElection() {
 	rf.mu.Lock()
+
+	// [Fast Raft] Find the last leader-approved log entry
+	var candLastLogIndex int
+	var candLastLogTerm int
+	for i := len(rf.log) - 1; i >= 0; i-- {
+		if rf.log[i].InsertedBy == "leader" {
+			candLastLogIndex = int(rf.log[i].Index)
+			candLastLogTerm = int(rf.log[i].Term)
+			break
+		}
+	}
+
+	// [Fast Raft] If no leader-approved log entry is found, set to the last log entry
+	if candLastLogIndex == 0 && candLastLogTerm == 0 {
+		candLastLogIndex = int(rf.log[len(rf.log)-1].Index)
+		candLastLogTerm = int(rf.log[len(rf.log)-1].Term)
+	}
+
 	args := pb.RequestVoteRequest{
 		Term:          int32(rf.currentTerm),
 		CandidatePort: rf.Transport.Addr(),
-		LastLogIdx:    rf.log[len(rf.log)-1].Index,
-		LastLogTerm:   rf.log[len(rf.log)-1].Term,
+		LastLogIdx:    int32(candLastLogIndex),
+		LastLogTerm:   int32(candLastLogTerm),
 	}
 	rf.mu.Unlock()
+
+	// Send RequestVote RPCs to peers
 	for _, addr := range rf.peers {
 		if addr != rf.Transport.Addr() {
 			go func(addr string) {
@@ -627,12 +661,13 @@ func MakeRaftServer(me string, peers []string) *RaftServer {
 	rf.nextIdx = make(map[string]int)
 	rf.matchIdx = make(map[string]int)
 	rf.fastMatchIdx = make(map[string]int)
-	rf.possibleEntries = make(map[int]map[string]int)
+	rf.possibleEntries = make(map[int][]*ProposedEntry)
 
 	rf.numVotes = 0
 	rf.votedFor = ""
-	rf.cWinElection = make(chan struct{}, 1000)
 	rf.cHeartbeat = make(chan struct{}, 1000)
+	rf.cWinElection = make(chan struct{}, 1000)
+	rf.cProposeEntry = make(chan ProposedEntry, 1000)
 	rf.cBootstrapComplete = make(chan struct{}, 10)
 	rf.connectionsCount = 0
 
@@ -686,4 +721,176 @@ func (rf *RaftServer) startGrpcServer() error {
 		return fmt.Errorf("failed to serve gRPC on port %s: %v", rf.Transport.Addr(), err)
 	}
 	return nil
+}
+
+// New to Fast Raft, the leader periodically checks if an
+// entry can be committed on the fast track. As discussed in
+// the overview, if a fast quorum has voted for an entry, it can
+// be committed. Otherwise, if at least a classic quorum has
+// voted for an index, the leader chooses the entry with the
+// most votes to insert into its log. The leader then switches to
+// the classic track, sending this entry to the follower to insert.
+// The fast track can only be taken here if the last index was
+// committed. This restriction is necessary since commitIndex
+// indicates that all entries at or before the index are committed.
+// If any entry was able to take the fast track, then
+// commitIndex could be updated prematurely, committing
+// log entries that should not be.
+func (rf *RaftServer) periodicallyCommitEntries() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	k := rf.commitIdx + 1
+
+	for {
+		// Check if a classic quorum has voted for an entry at index k
+		if entries, exists := rf.possibleEntries[k]; exists {
+			// Find the entry with the highest number of votes
+			var selectedEntry *ProposedEntry
+			maxVotes := 0
+
+			for _, entry := range entries {
+				if entry.Count > maxVotes {
+					selectedEntry = entry
+					maxVotes = entry.Count
+				}
+			}
+
+			if selectedEntry != nil && maxVotes >= rf.fastQuorumSize() {
+				// (a) Insert entry `e` with the highest number of votes
+				rf.log = append(rf.log, selectedEntry.Entry)
+
+				// (b) Mark the entry as inserted by the leader
+				selectedEntry.Entry.InsertedBy = "leader"
+
+				// (c) Update `fastMatchIdx` for all voters
+				for _, voter := range rf.peers {
+					if rf.fastMatchIdx[voter] < int(selectedEntry.Entry.Index) {
+						rf.fastMatchIdx[voter] = int(selectedEntry.Entry.Index)
+					}
+				}
+
+				// (d) Remove duplicate votes in `possibleEntries`
+				for idx, entries := range rf.possibleEntries {
+					for i, entry := range entries {
+						if entry.Entry == selectedEntry.Entry && idx != int(selectedEntry.Entry.Index) {
+							rf.possibleEntries[idx][i].Count = 0
+						}
+					}
+				}
+
+				// (e) Check for fast quorum to commit the entry
+				if rf.hasFastQuorum(k) && rf.log[k-1].Term == int32(rf.currentTerm) {
+					rf.commitIdx = k
+				}
+
+				break // Move to the next index
+			}
+		}
+
+		// Exit the loop if no more entries can be committed
+		if k > len(rf.log) {
+			break
+		}
+		k++
+	}
+}
+
+// [Fast Raft] Check if a fast quorum
+// exists for committing the given index
+func (rf *RaftServer) hasFastQuorum(k int) bool {
+	fastQuorumCount := 0
+
+	for _, matchIdx := range rf.fastMatchIdx {
+		if matchIdx >= k {
+			fastQuorumCount++
+		}
+	}
+
+	return fastQuorumCount >= rf.fastQuorumSize()
+}
+
+// Follower: Handle proposed entry e for site i
+func (rf *RaftServer) handleProposedEntryFollower(proposal *ProposedEntry) {
+	e := proposal.Entry
+	index := int(e.Index)
+
+	// Check if entry is a duplicate and already committed
+	if e.Index <= int32(rf.commitIdx) {
+		log.DPrintf("[%v] (handleProposedEntry) Duplicate and committed entry %d", rf.Transport.Addr(), e.Index)
+		// Notify the proposer (this could be sending a response or notifying the proposer in some other way)
+		return
+	}
+
+	// If no entry at index i, insert the entry
+	if len(rf.log) <= index || rf.log[index].Index != e.Index {
+		log.DPrintf("[%v] (handleProposedEntry) Inserting entry %d at index %d", rf.Transport.Addr(), e.Index, index)
+		// Insert the entry at the correct position
+		rf.log[index] = e
+	}
+
+	e.InsertedBy = "self"
+
+	// Send the log entry and commit index to the leader
+	rf.sendLogEntryToLeader(e)
+}
+
+// Leader: Handle proposed entry e for site i
+func (rf *RaftServer) handleProposedEntryLeader(proposal *ProposedEntry) {
+	e := proposal.Entry
+	index := int(e.Index)
+
+	log.DPrintf("[%v] (handleProposedEntryLeader) Handling proposed entry %d from site [%v]", rf.Transport.Addr(), e.Index, proposal.Site)
+
+	// Search for the entry in the possibleEntries[index]
+	entries := rf.possibleEntries[index]
+	found := false
+	for _, entry := range entries {
+		if entry == proposal {
+			entry.Count++
+			found = true
+			break
+		}
+	}
+
+	// If not found, add the entry with a count of 1
+	if !found {
+		rf.possibleEntries[index] = append(rf.possibleEntries[index], &ProposedEntry{
+			Entry: e,
+			Site:  rf.Transport.Addr(),
+			Count: 1,
+		})
+	}
+
+	// Set the nextIndex for the proposing
+	// site to the sentCommitIndex
+	siteID := proposal.Site
+	rf.nextIdx[siteID] = rf.commitIdx
+
+	log.DPrintf("[Leader] Updated nextIndex[%v] to %d", siteID, rf.commitIdx)
+}
+
+// Send log entry and commit index to leader
+func (rf *RaftServer) sendLogEntryToLeader(e *pb.LogElement) {
+	// Assume leaderAddr is set and connection exists
+	if rf.leaderAddr != "" {
+		conn, ok := rf.ReplicaConnMap[rf.leaderAddr]
+		if !ok || conn == nil {
+			log.DPrintf("[%v] (sendLogEntryToLeader) No connection to leader %s", rf.Transport.Addr(), rf.leaderAddr)
+			return
+		}
+
+		// Create a new gRPC client
+		raftClient := pb.NewRaftServiceClient(conn)
+
+		// Send the log entry and commit index to leader
+		_, err := raftClient.ApplyCommand(context.Background(), &pb.ApplyCommandRequest{
+			Command: e.Command,
+		})
+		if err != nil {
+			log.DPrintf("[%v] (sendLogEntryToLeader) Error sending log entry to leader: %v", rf.Transport.Addr(), err)
+		} else {
+			log.DPrintf("[%v] (sendLogEntryToLeader) Successfully sent log entry %d to leader", rf.Transport.Addr(), e.Index)
+		}
+	}
 }

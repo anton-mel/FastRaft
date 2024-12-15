@@ -62,6 +62,7 @@ message RequestVoteRequest {
 message RequestVoteResponse {
   int32 term = 1;
   bool voteGranted = 2;
+  repeated LogElement selfApprovedEntries = 3;
 }
 
 
@@ -98,3 +99,4 @@ message ApplyOperationRequest {}
 message ApplyOperationResponse {}
 message ForwardOperationRequest { string operation = 1; }
 message ForwardOperationResponse {}
+
