@@ -29,6 +29,7 @@ message LogElement {
   int32 index = 1;
   int32 term = 2;
   string command = 3;
+  string insertedBy = 4;
 }
 
 // Request for AppendEntries

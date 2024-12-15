@@ -22,9 +22,6 @@ func NewRaftServiceServer(rf *RaftServer) *RaftServiceServer {
 
 func (s *RaftServiceServer) AddReplica(ctx context.Context, addrInfo *pb.AddrInfo) (*pb.AddrInfoStatus, error) {
 	log.DPrintf("[%s] received (addReplica) request from [%s]", s.rf.Transport.Addr(), addrInfo.Addr)
-	if addrInfo.Addr == "0.0.0.0:5000" {
-		return &pb.AddrInfoStatus{IsAdded: false}, nil
-	}
 
 	if ok := s.rf.ReplicaConnMap[addrInfo.Addr]; ok != nil {
 		// raft server already present
@@ -38,6 +35,7 @@ func (s *RaftServiceServer) AddReplica(ctx context.Context, addrInfo *pb.AddrInf
 		addrInfo.Addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
 	)
+
 	if err != nil {
 		log.DPrintf("[%s] error while creating gRPC client to [%s]", s.rf.Transport.Addr(), addrInfo.Addr)
 		return &pb.AddrInfoStatus{IsAdded: false}, err
@@ -116,7 +114,7 @@ func (s *RaftServiceServer) AppendEntries(ctx context.Context, args *pb.AppendEn
 				s.rf.mu.Lock()
 				defer s.rf.mu.Unlock()
 				for i := s.rf.appliedLast + 1; i <= s.rf.commitIdx; i++ {
-					s.rf.performCommit(s.rf.log[i-int(s.rf.log[0].Index)].Command)
+					s.rf.insertEntry(s.rf.log[i-int(s.rf.log[0].Index)].Command, "leader")
 					// msg := ApplyMsg{CommandValid: true, Command: s.rf.log[i-s.rf.log[0].Index].Command, CommandIndex: i}
 					// s.rf.cApplyMsg <- msg
 				}
@@ -185,9 +183,10 @@ func (s *RaftServiceServer) CommitOperation(context context.Context, txn *pb.Com
 	}
 
 	newLogEntry := &pb.LogElement{
-		Index:   int32(txn.Index),
-		Command: txn.Operation,
-		Term:    int32(txn.Term),
+		Index:      int32(txn.Index),
+		Command:    txn.Operation,
+		Term:       int32(txn.Term),
+		InsertedBy: "leader",
 	}
 	s.rf.log = append(s.rf.log, newLogEntry)
 
@@ -210,6 +209,6 @@ func (s *RaftServiceServer) ApplyOperation(ctx context.Context, txn *pb.ApplyOpe
 }
 
 func (s *RaftServiceServer) ForwardOperation(ctx context.Context, in *pb.ForwardOperationRequest) (*pb.ForwardOperationResponse, error) {
-	s.rf.performCommit(in.Operation)
+	s.rf.insertEntry(in.Operation, "self")
 	return &pb.ForwardOperationResponse{}, nil
 }
