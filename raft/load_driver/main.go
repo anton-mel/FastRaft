@@ -130,7 +130,7 @@ func main() {
 		// }
 	}
 
-	time.Sleep(3 * time.Second)
+	time.Sleep(5 * time.Second)
 
 	// Fetch logs
 	allLogs := make([][]*pb.LogElement, len(peers))
@@ -148,7 +148,8 @@ func main() {
 	}
 
 	mismatch := 0
-	for i := 0; i < len(allLogs[0]); i++ {
+	minLen := min(len(allLogs[0]), len(allLogs[1]), len(allLogs[2]))
+	for i := 0; i < minLen; i++ {
 		for idx := range peers {
 			if allLogs[0][i].Term != allLogs[idx][i].Term || allLogs[0][i].Command != allLogs[idx][i].Command || allLogs[0][i].Index != allLogs[idx][i].Index {
 				log.DPrintf("Log mismatch at index %d: %s != %s", i, allLogs[0][i].Command, allLogs[idx][i].Command)

@@ -165,7 +165,8 @@ func (rf *RaftServer) PerformOperation(command string) error {
 
 		// Start a timeout check for proposal commit (VERY NOT SURE)
 		// Look (To propose an entry) table for more info.
-		go rf.handleProposalTimeout(command)
+		// go rf.handleProposalTimeout(command)
+		// go rf.PerformOperation(command)
 		return nil
 	}
 }
@@ -467,7 +468,7 @@ func (rf *RaftServer) broadcastHeartbeat() {
 				return
 			}
 
-			if nextIdx <= int(baseIdx) {
+			if nextIdx < int(baseIdx) {
 				// snapshot? but not necessary for lab
 				// continue
 			} else {
@@ -619,7 +620,7 @@ func (rf *RaftServer) startElection() {
 // server to their replicaConnMap (establish gRPC connection)
 func (rf *RaftServer) bootstrapNetwork() {
 	// If there are no peers initially, wait for connections
-	time.Sleep(7 * time.Second)
+	time.Sleep(8 * time.Second)
 	if len(rf.peers) == 0 {
 		rf.waitForIncomingConnections()
 	} else {
@@ -696,7 +697,7 @@ func parseFlags(me string, peers []string) (string, []string) {
 }
 
 func MakeRaftServer(me string, peers []string) *RaftServer {
-	time.Sleep(time.Second * 4)
+	time.Sleep(time.Second * 5)
 
 	rf := &RaftServer{}
 	// [Deployement Testing]
@@ -783,6 +784,28 @@ func (rf *RaftServer) startGrpcServer() error {
 	return nil
 }
 
+func (rf *RaftServer) broadcastAppendEntriesForIndex(index int) {
+	if index <= 0 || index >= len(rf.log) {
+		return
+	}
+	// Build an AppendEntriesRequest with the new entry
+	entry := rf.log[index]
+	args := pb.AppendEntriesRequest{
+		Term:         int32(rf.currentTerm),
+		Leader:       rf.Transport.Addr(),
+		LeaderAddr:   rf.Transport.Addr(),
+		PrevLogIdx:   int32(index - 1),
+		PrevLogTerm:  rf.log[index-1].Term,
+		Entries:      []*pb.LogElement{entry},
+		LeaderCommit: int32(rf.commitIdx),
+	}
+	for _, peer := range rf.peers {
+		if peer != rf.Transport.Addr() {
+			go rf.sendAppendEntries(peer, &args, &pb.AppendEntriesResponse{})
+		}
+	}
+}
+
 // New to Fast Raft, the leader periodically checks if an
 // entry can be committed on the fast track. As discussed in
 // the overview, if a fast quorum has voted for an entry, it can
@@ -818,29 +841,34 @@ func (rf *RaftServer) periodicallyCommitEntries() {
 
 			if selectedEntry != nil && maxVotes >= rf.fastQuorumSize() {
 				// (a) Insert entry `e` with the highest number of votes
+				newIndex := len(rf.log)
+				selectedEntry.Entry.Index = int32(newIndex)
+				selectedEntry.Entry.Term = int32(rf.currentTerm)
+				selectedEntry.Entry.InsertedBy = "leader"
 				rf.log = append(rf.log, selectedEntry.Entry)
 
 				// (b) Mark the entry as inserted by the leader
-				selectedEntry.Entry.InsertedBy = "leader"
+				// selectedEntry.Entry.InsertedBy = "leader"
 
 				// (c) Update `fastMatchIdx` for all voters
+				rf.broadcastAppendEntriesForIndex(newIndex)
 				for _, voter := range rf.peers {
 					if rf.fastMatchIdx[voter] < int(selectedEntry.Entry.Index) {
 						rf.fastMatchIdx[voter] = int(selectedEntry.Entry.Index)
 					}
 				}
 
-				// (d) Remove duplicate votes in `possibleEntries`
-				for idx, entries := range rf.possibleEntries {
-					for i, entry := range entries {
-						if entry.Entry == selectedEntry.Entry && idx != int(selectedEntry.Entry.Index) {
-							rf.possibleEntries[idx][i].Count = 0
-						}
-					}
-				}
+				// // (d) Remove duplicate votes in `possibleEntries`
+				// for idx, entries := range rf.possibleEntries {
+				// 	for i, entry := range entries {
+				// 		if entry.Entry == selectedEntry.Entry && idx != int(selectedEntry.Entry.Index) {
+				// 			rf.possibleEntries[idx][i].Count = 0
+				// 		}
+				// 	}
+				// }
 
 				// (e) Check for fast quorum to commit the entry
-				if rf.hasFastQuorum(k) && rf.log[k-1].Term == int32(rf.currentTerm) {
+				if rf.hasFastQuorum(k) && int32(rf.log[k-1].Term) == int32(rf.currentTerm) {
 					rf.commitIdx = k
 				}
 
@@ -906,11 +934,15 @@ func (rf *RaftServer) handleProposedEntryLeader(proposal *ProposedEntry) {
 
 	log.DPrintf("[%v] (handleProposedEntryLeader) Handling proposed entry %d from site [%v]", rf.Transport.Addr(), e.Index, proposal.Site)
 
+	if rf.possibleEntries[index] == nil {
+		rf.possibleEntries[index] = []*ProposedEntry{}
+	}
+
 	// Search for the entry in the possibleEntries[index]
 	entries := rf.possibleEntries[index]
 	found := false
 	for _, entry := range entries {
-		if entry == proposal {
+		if entry.Entry.Index == e.Index && entry.Entry.Command == e.Command {
 			entry.Count++
 			found = true
 			break
